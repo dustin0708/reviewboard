@@ -56,79 +56,6 @@ class TrophyType(object):
     #: It is recommended to use a height of 48px max.
     image_height = None
 
-    def __init__(self, title=None, image_url=None, image_width=None,
-                 image_height=None):
-        """Initialize the trophy.
-
-        This accepts deprecated arguments for the trophy information.
-        Subclasses should instead define the appropriate attributes on the
-        class body.
-
-        Args:
-            title (unicode, optional):
-                The name of the trophy.
-
-                Subclasses should instead set :py:attr:`name`.
-
-                .. deprecated:: 3.0
-
-            image_url (unicode, optional):
-                The URL of the trophy.
-
-                Subclasses should instead set :py:attr:`image_urls`.
-
-                .. deprecated:: 3.0
-
-            image_width (int, optional):
-                The width of the image.
-
-                Subclasses should instead set :py:attr:`image_width`.
-
-                .. deprecated:: 3.0
-
-            image_height (int, optional):
-                The height of the image.
-
-                Subclasses should instead set :py:attr:`image_height`.
-
-                .. deprecated:: 3.0
-        """
-        if not self.name and title:
-            warnings.warn('%r should define "name" as a class attribute '
-                          'instead of passing "title" to the constructor.'
-                          % self.__class__,
-                          DeprecationWarning)
-
-            self.name = title
-
-        if not self.image_urls and image_url:
-            warnings.warn('%r should define "image_urls" as a class attribute '
-                          'instead of passing "image_url" to the constructor.'
-                          % self.__class__,
-                          DeprecationWarning)
-
-            self.image_urls = {
-                '1x': image_url,
-            }
-
-        if not self.image_width:
-            warnings.warn('%r should define "image_width" as a class '
-                          'attribute instead of passing "image_width" to '
-                          'the constructor.'
-                          % self.__class__,
-                          DeprecationWarning)
-
-            self.image_width = image_width or 32
-
-        if not self.image_height:
-            warnings.warn('%r should define "image_height" as a class '
-                          'attribute instead of passing "image_height" to '
-                          'the constructor.'
-                          % self.__class__,
-                          DeprecationWarning)
-
-            self.image_height = image_height or 48
-
     def get_display_text(self, trophy):
         """Return the text to display in the trophy banner.
 
@@ -155,6 +82,35 @@ class TrophyType(object):
         """
         raise NotImplementedError
 
+    def format_display_text(self, request, trophy, **kwargs):
+        """Format the display text for the trophy.
+
+        Args:
+            request (django.http.HttpRequest):
+                The HTTP request from the client.
+
+            trophy (reviewboard.accounts.models.Trophy):
+                The trophy instance.
+
+            **kwargs (dict):
+                Additional keyword arguments to use for formatting.
+
+        Returns:
+            unicode:
+            The rendered text.
+        """
+        if self.display_format_str is None:
+            raise NotImplementedError(
+                '%s does not define the format_display_str attribute.'
+                % type(self).__name__
+            )
+
+        return self.display_format_str % dict(kwargs, **{
+            'recipient': trophy.user.get_profile().get_display_name(
+                getattr(request, 'user', None)),
+            'review_request_id': trophy.review_request.display_id,
+        })
+
 
 class MilestoneTrophy(TrophyType):
     """A milestone trophy.
@@ -174,21 +130,9 @@ class MilestoneTrophy(TrophyType):
     image_width = 33
     image_height = 35
 
-    def get_display_text(self, trophy):
-        """Return the text to display in the trophy banner.
-
-        Args:
-            trophy (reviewboard.accounts.models.Trophy):
-                The stored trophy information.
-
-        Returns:
-            unicode:
-            The display text for the trophy banner.
-        """
-        return _('%(user)s got review request #%(rid)s!') % {
-            'user': trophy.user.get_full_name() or trophy.user.username,
-            'rid': trophy.review_request.display_id
-        }
+    display_format_str = _(
+        '%(recipient)s got review request #%(review_request_id)d!'
+    )
 
     def qualifies(self, review_request):
         """Return whether this trophy should be given to this review request.
@@ -224,6 +168,8 @@ class FishTrophy(TrophyType):
     image_width = 33
     image_height = 37
 
+    display_format_str = _('%(recipient)s got a fish trophy!')
+
     def qualifies(self, review_request):
         """Return whether this trophy should be given to this review request.
 
@@ -239,21 +185,6 @@ class FishTrophy(TrophyType):
 
         return (review_request.display_id >= 1000 and
                 id_str == ''.join(reversed(id_str)))
-
-    def get_display_text(self, trophy):
-        """Return the text to display in the trophy banner.
-
-        Args:
-            trophy (reviewboard.accounts.models.Trophy):
-                The stored trophy information.
-
-        Returns:
-            unicode:
-            The display text for the trophy banner.
-        """
-        return _('%(user)s got a fish trophy!') % {
-            'user': trophy.user.get_full_name() or trophy.user.username,
-        }
 
 
 class UnknownTrophy(TrophyType):
@@ -359,102 +290,3 @@ class TrophyRegistry(Registry):
 
 #: The registry of available trophies.
 trophies_registry = TrophyRegistry()
-
-
-def register_trophy(trophy):
-    """Register a TrophyType subclass.
-
-    This will register a type of trophy. Review Board will use it to calculate
-    and display possible trophies.
-
-    Only :py:class:`TrophyType` subclasses are supported.
-
-    .. deprecated:: 3.0
-
-       This is deprecated in favor of calling ``trophies_registry.register``.
-
-    Args:
-        trophy (type):
-            The trophy type (subclass of :py:class:`TrophyType`) to register.
-
-    Raises:
-        TypeError:
-            The provided trophy to register is not a :py:class:`TrophyType`
-            subclass.
-
-        KeyError:
-            The trophy could not be registered.
-    """
-    warnings.warn('register_trophy() is deprecated. Please use '
-                  'reviewboard.accounts.trophies:trophies_registry.register() '
-                  'instead.',
-                  DeprecationWarning)
-
-    if not issubclass(trophy, TrophyType):
-        raise TypeError('Only TrophyType subclasses can be registered')
-
-    try:
-        trophies_registry.register(trophy)
-    except AlreadyRegisteredError as e:
-        raise KeyError(six.text_type(e))
-
-
-def unregister_trophy(trophy):
-    """Unregister a TrophyType subclass.
-
-    This will unregister a previously registered type of trophy.
-
-    Only :py:class:`TrophyType` subclasses are supported. The class must have
-    been registered beforehand or a :py:exc:`ValueError` will be thrown.
-
-    .. deprecated:: 3.0
-
-       This is deprecated in favor of calling ``trophies_registry.unregister``.
-
-    Args:
-        trophy (type):
-            The trophy type (subclass of :py:class:`TrophyType`) to unregister.
-
-    Raises:
-        TypeError:
-            The provided trophy to register is not a :py:class:`TrophyType`
-            subclass.
-
-        ValueError:
-            The trophy could not be unregistered.
-    """
-    warnings.warn('unregister_trophy() is deprecated. Please use '
-                  'reviewboard.accounts.trophies:trophies_registry'
-                  '.unregister() instead.',
-                  DeprecationWarning)
-
-    if not issubclass(trophy, TrophyType):
-        raise TypeError('Only TrophyType subclasses can be unregistered')
-
-    try:
-        trophies_registry.unregister(trophy)
-    except ItemLookupError as e:
-        raise ValueError(six.text_type(e))
-
-
-def get_registered_trophy_types():
-    """Return all registered trophy types.
-
-    .. deprecated:: 3.0
-
-       This is deprecated in favor of iterating through
-       :py:data:`trophies_registry`.
-
-    Returns:
-        list of TrophyType:
-        The list of all registered trophies.
-    """
-    warnings.warn('get_registered_trophy_types() is deprecated. Please '
-                  'iterate through '
-                  'reviewboard.accounts.trophies:trophies_registry instead.',
-                  DeprecationWarning)
-
-    return {
-        trophy.category: trophy
-        for trophy in trophies_registry
-    }

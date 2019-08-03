@@ -4,7 +4,7 @@ from django.utils import six
 from djblets.testing.decorators import add_fixtures
 
 from reviewboard.webapi.resources import resources
-from reviewboard.webapi.errors import REPO_NOT_IMPLEMENTED
+from reviewboard.webapi.errors import REPO_INFO_ERROR, REPO_NOT_IMPLEMENTED
 from reviewboard.webapi.tests.base import BaseWebAPITestCase
 from reviewboard.webapi.tests.mimetypes import repository_commits_item_mimetype
 from reviewboard.webapi.tests.mixins import BasicTestsMetaclass
@@ -39,7 +39,7 @@ class ResourceTests(BaseWebAPITestCase):
         repository = self.create_repository(tool_name='Test')
 
         rsp = self.api_get(get_repository_commits_url(repository),
-                           query={'start': 5},
+                           data={'start': 5},
                            expected_mimetype=repository_commits_item_mimetype)
         self.assertEqual(rsp['stat'], 'ok')
         self.assertEqual(len(rsp['commits']), 5)
@@ -55,7 +55,7 @@ class ResourceTests(BaseWebAPITestCase):
 
         rsp = self.api_get(
             get_repository_commits_url(repository, self.local_site_name),
-            query={'start': 7},
+            data={'start': 7},
             expected_mimetype=repository_commits_item_mimetype)
         self.assertEqual(len(rsp['commits']), 7)
         self.assertEqual(rsp['stat'], 'ok')
@@ -78,15 +78,46 @@ class ResourceTests(BaseWebAPITestCase):
         with a repository that does not implement it
         """
         repository = self.create_repository(tool_name='CVS')
-        repository.save()
 
         try:
             rsp = self.api_get(
                 get_repository_commits_url(repository),
-                query={'start': ''},
+                data={'start': ''},
                 expected_status=501)
         except ImportError:
             raise nose.SkipTest("cvs binary not found")
 
         self.assertEqual(rsp['stat'], 'fail')
         self.assertEqual(rsp['err']['code'], REPO_NOT_IMPLEMENTED.code)
+
+    def test_get_with_hosting_service_error(self):
+        """Testing the GET repositories/<id>/commits/ API with
+        HostingServiceError
+        """
+        repository = self.create_repository(tool_name='Test')
+
+        rsp = self.api_get(
+            get_repository_commits_url(repository),
+            data={
+                'branch': 'bad:hosting-service-error',
+            },
+            expected_status=500)
+
+        self.assertEqual(rsp['stat'], 'fail')
+        self.assertEqual(rsp['err']['code'], REPO_INFO_ERROR.code)
+        self.assertEqual(rsp['err']['msg'], 'This is a HostingServiceError')
+
+    def test_get_with_scm_error(self):
+        """Testing the GET repositories/<id>/commits/ API with SCMError"""
+        repository = self.create_repository(tool_name='Test')
+
+        rsp = self.api_get(
+            get_repository_commits_url(repository),
+            data={
+                'branch': 'bad:scm-error',
+            },
+            expected_status=500)
+
+        self.assertEqual(rsp['stat'], 'fail')
+        self.assertEqual(rsp['err']['code'], REPO_INFO_ERROR.code)
+        self.assertEqual(rsp['err']['msg'], 'This is a SCMError')

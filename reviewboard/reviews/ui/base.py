@@ -8,11 +8,10 @@ from uuid import uuid4
 import mimeparse
 from django.core.exceptions import ObjectDoesNotExist
 from django.http import HttpResponse
-from django.template.context import RequestContext
-from django.template.loader import render_to_string
 from django.utils import six
 from django.utils.safestring import mark_safe
 from django.utils.translation import ugettext as _
+from djblets.util.compat.django.template.loader import render_to_string
 
 from reviewboard.attachments.mimetypes import MIMETYPE_EXTENSIONS, score_match
 from reviewboard.attachments.models import (FileAttachment,
@@ -204,8 +203,9 @@ class ReviewUI(object):
             context = self.build_render_context(request, inline=inline)
 
             return render_to_string(
-                self.template_name,
-                RequestContext(request, context))
+                template_name=self.template_name,
+                context=context,
+                request=request)
         except Exception as e:
             logging.exception('Error when rendering %r: %s', self, e)
 
@@ -228,8 +228,8 @@ class ReviewUI(object):
             dict:
             The context to use in the template.
         """
-        last_activity_time, updated_object = \
-            self.review_request.get_last_activity()
+        last_activity_time = \
+            self.review_request.get_last_activity_info()['timestamp']
 
         draft = self.review_request.get_draft(request.user)
         review_request_details = draft or self.review_request
@@ -457,7 +457,7 @@ class ReviewUI(object):
                 continue
 
             try:
-                if review and (review.public or review.user == user):
+                if review and (review.public or review.user_id == user.pk):
                     result.append(self.serialize_comment(comment))
             except Exception as e:
                 logging.exception('Error when calling serialize_comment for '
@@ -495,10 +495,10 @@ class ReviewUI(object):
                                                 comment.rich_text),
             'user': {
                 'username': review.user.username,
-                'name': review.user.get_full_name() or review.user.username,
+                'name': review.user.get_profile().get_display_name(user),
             },
             'url': comment.get_review_url(),
-            'localdraft': review.user == user and not review.public,
+            'localdraft': review.user_id == user.pk and not review.public,
             'review_id': review.pk,
             'review_request_id': review.review_request_id,
             'issue_opened': comment.issue_opened,
@@ -788,8 +788,10 @@ class FileAttachmentReviewUI(ReviewUI):
         """Return the Review UI and score that that best fit the mimetype.
 
         Args:
-            mimetype (unicode):
-                The mimetype to find a Review UI for.
+            mimetype (tuple):
+                A parsed mimetype to find the best review UI for. This is a
+                3-tuple of the type, subtype, and parameters as returned by
+                :py:func:`mimeparse.parse_mime_type`.
 
         Returns:
             tuple:

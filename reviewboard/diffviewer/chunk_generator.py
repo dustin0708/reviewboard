@@ -8,8 +8,8 @@ import re
 from django.utils import six
 from django.utils.html import escape
 from django.utils.safestring import mark_safe
-from django.utils.six.moves import range
-from django.utils.translation import get_language
+from django.utils.six.moves import range, zip_longest
+from django.utils.translation import get_language, ugettext as _
 from djblets.log import log_timed
 from djblets.cache.backend import cache_memoize
 from djblets.siteconfig.models import SiteConfiguration
@@ -76,6 +76,59 @@ class RawDiffChunkGenerator(object):
     def __init__(self, old, new, orig_filename, modified_filename,
                  enable_syntax_highlighting=True, encoding_list=None,
                  diff_compat=DiffCompatVersion.DEFAULT):
+        """Initialize the chunk generator.
+
+        Args:
+            old (bytes or list of bytes):
+                The old data being modified.
+
+            new (bytes or list of bytes):
+                The new data.
+
+            orig_filename (unicode):
+                The filename corresponding to the old data.
+
+            modified_filename (unicode):
+                The filename corresponding to the new data.
+
+            enable_syntax_highlighting (bool, optional):
+                Whether to syntax-highlight the lines.
+
+            encoding_list (list of unicode, optional):
+                A list of encodings to try for the ``old`` and ``new`` data,
+                when converting to Unicode. If not specified, this defaults
+                to ``iso-8859-15``.
+
+            diff_compat (int, optional):
+                A specific diff compatibility version to use for any diffing
+                logic.
+        """
+        # Check that the data coming in is in the formats we accept.
+        for param, param_name in ((old, 'old'), (new, 'new')):
+            if param is not None:
+                if isinstance(param, list):
+                    if param and not isinstance(param[0], bytes):
+                        raise TypeError(
+                            _('%s expects None, list of bytes, or bytes '
+                              'value for "%s", not list of %s')
+                            % (type(self).__name__, param_name,
+                               type(param[0])))
+                elif not isinstance(param, bytes):
+                    raise TypeError(
+                        _('%s expects None, list of bytes, or bytes value '
+                          'for "%s", not %s')
+                        % (type(self).__name__, param_name, type(param)))
+
+        if not isinstance(orig_filename, six.text_type):
+            raise TypeError(
+                _('%s expects a Unicode value for "orig_filename"')
+                % type(self).__name__)
+
+        if not isinstance(modified_filename, six.text_type):
+            raise TypeError(
+                _('%s expects a Unicode value for "modified_filename"')
+                % type(self).__name__)
+
         self.old = old
         self.new = new
         self.orig_filename = orig_filename
@@ -208,10 +261,17 @@ class RawDiffChunkGenerator(object):
             new_lines = markup_b[j1:j2]
             num_lines = max(len(old_lines), len(new_lines))
 
-            lines = map(functools.partial(self._diff_line, tag, meta),
+            lines = [
+                self._diff_line(tag, meta, *diff_args)
+                for diff_args in zip_longest(
                         range(line_num, line_num + num_lines),
-                        range(i1 + 1, i2 + 1), range(j1 + 1, j2 + 1),
-                        a[i1:i2], b[j1:j2], old_lines, new_lines)
+                        range(i1 + 1, i2 + 1),
+                        range(j1 + 1, j2 + 1),
+                        a[i1:i2],
+                        b[j1:j2],
+                        old_lines,
+                        new_lines)
+            ]
 
             counts[tag] += num_lines
 
@@ -626,7 +686,7 @@ class RawDiffChunkGenerator(object):
             self.differ.get_interesting_lines('header', is_modified_file)
 
         if not possible_functions:
-            raise StopIteration
+            return
 
         try:
             if is_modified_file:
@@ -638,15 +698,15 @@ class RawDiffChunkGenerator(object):
                 i1 = lines[start][1]
                 i2 = lines[end - 1][1]
         except IndexError:
-            raise StopIteration
+            return
 
         for i in range(last_index, len(possible_functions)):
             linenum, line = possible_functions[i]
             linenum += 1
 
-            if linenum > i2:
+            if i2 != '' and linenum > i2:
                 break
-            elif linenum >= i1:
+            elif i1 != '' and linenum >= i1:
                 last_index = i
                 yield linenum, line
 
@@ -710,7 +770,36 @@ class DiffChunkGenerator(RawDiffChunkGenerator):
     """
 
     def __init__(self, request, filediff, interfilediff=None,
-                 force_interdiff=False, enable_syntax_highlighting=True):
+                 force_interdiff=False, enable_syntax_highlighting=True,
+                 base_filediff=None):
+        """Initialize the DiffChunkGenerator.
+
+        Args:
+            request (django.http.HttpRequest):
+                The HTTP request from the client.
+
+            filediff (reviewboard.diffviewer.models.filediff.FileDiff):
+                The FileDiff to generate chunks for.
+
+            interfilediff (reviewboard.diffviewer.models.filediff.FileDiff,
+                           optional):
+                If provided, the chunks will be generated for the differences
+                between the result of applying ``filediff`` and the result of
+                applying ``interfilediff``.
+
+            force_interdiff (bool, optional):
+                Whether or not to force an interdiff.
+
+            enable_syntax_highlighting (bool, optional):
+                Whether or not to enable syntax highlighting.
+
+            base_filediff (reviewboard.diffviewer.models.filediff.FileDiff,
+                           optional):
+                An ancestor of ``filediff`` that we want to use as the base.
+                Using this argument will result in the history between
+                ``base_filediff`` and ``filediff`` being applied.
+
+        """
         assert filediff
 
         self.request = request
@@ -720,11 +809,17 @@ class DiffChunkGenerator(RawDiffChunkGenerator):
         self.force_interdiff = force_interdiff
         self.repository = self.diffset.repository
         self.tool = self.repository.get_scmtool()
+        self.base_filediff = base_filediff
+
+        if base_filediff:
+            orig_filename = base_filediff.source_file
+        else:
+            orig_filename = filediff.source_file
 
         super(DiffChunkGenerator, self).__init__(
             old=None,
             new=None,
-            orig_filename=filediff.source_file,
+            orig_filename=orig_filename,
             modified_filename=filediff.dest_file,
             enable_syntax_highlighting=enable_syntax_highlighting,
             encoding_list=self.repository.get_encoding_list(),
@@ -736,6 +831,9 @@ class DiffChunkGenerator(RawDiffChunkGenerator):
 
         if self.enable_syntax_highlighting:
             key += 'hl-'
+
+        if self.base_filediff is not None:
+            key += 'base-%s-' % self.base_filediff.pk
 
         if not self.force_interdiff:
             key += six.text_type(self.filediff.pk)
@@ -779,7 +877,7 @@ class DiffChunkGenerator(RawDiffChunkGenerator):
               self.filediff.moved or self.filediff.copied) and
              counts['raw_insert_count'] == 0 and
              counts['raw_delete_count'] == 0)):
-            raise StopIteration
+            return
 
         cache_key = self.make_cache_key()
 
@@ -791,6 +889,44 @@ class DiffChunkGenerator(RawDiffChunkGenerator):
         old = get_original_file(self.filediff, self.request,
                                 self.encoding_list)
         new = get_patched_file(old, self.filediff, self.request)
+
+        if self.base_filediff is not None:
+            # The diff is against a commit that:
+            #
+            # 1. Follows the first commit in a series (the first won't have
+            #    a base_commit/base_filediff that can be looked up)
+            #
+            # 2. Follows a commit that modifies this file, or is the base
+            #    commit that modifies this file.
+            #
+            # We'll be diffing against the patched version of this commit's
+            # version of the file.
+            old = get_original_file(self.base_filediff, self.request,
+                                    self.encoding_list)
+            old = get_patched_file(old, self.base_filediff, self.request)
+        elif self.filediff.commit_id:
+            # This diff is against a commit, but no previous FileDiff
+            # modifying this file could be found. As per the above comment,
+            # this could end up being the very first commit in a series, or
+            # it might not have been modified in the base commit or any
+            # previous commit.
+            #
+            # We'll need to fetch the first ancestor of this file in the
+            # commit history, if we can find one. We'll base the "old" version
+            # of the file on the original version of this commit, meaning that
+            # this commit and all modifications since will be shown as "new".
+            # Basically, viewing the upstream of the file, before any commits.
+            #
+            # This should be safe because, without a base_filediff, there
+            # should be no older commit containing modifications that we want
+            # to diff against. This would be the first one, and we're using
+            # its upstream changes.
+            ancestors = self.filediff.get_ancestors(minimal=True)
+
+            if ancestors:
+                old = get_original_file(ancestors[0],
+                                        self.request,
+                                        self.encoding_list)
 
         if self.filediff.orig_sha1 is None:
             self.filediff.extra_data.update({
@@ -834,7 +970,9 @@ class DiffChunkGenerator(RawDiffChunkGenerator):
 
         log_timer.done()
 
-        if not self.interfilediff and not self.force_interdiff:
+        if (not self.interfilediff and
+            not self.base_filediff and
+            not self.force_interdiff):
             insert_count = self.counts['insert']
             delete_count = self.counts['delete']
             replace_count = self.counts['replace']

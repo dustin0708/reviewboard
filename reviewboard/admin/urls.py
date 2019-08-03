@@ -37,7 +37,7 @@ from reviewboard.admin import forms, views
 NEWS_FEED = 'https://www.reviewboard.org/news/feed/'
 
 urlpatterns = [
-    url(r'^$', views.dashboard),
+    url(r'^$', views.dashboard, name='admin-dashboard'),
 
     url(r'^cache/$', views.cache_stats, name='admin-server-cache'),
 
@@ -111,6 +111,14 @@ urlpatterns = [
             },
             name='settings-logging'),
 
+        url(r'^privacy/$',
+            views.site_settings,
+            kwargs={
+                'form_class': forms.PrivacySettingsForm,
+                'template_name': 'admin/privacy_settings.html',
+            },
+            name='settings-privacy'),
+
         url(r'^ssh/$',
             views.ssh_settings,
             name='settings-ssh'),
@@ -145,6 +153,4 @@ urlpatterns = [
     url(r'^widget-move/$', views.widget_move),
 
     url(r'^widget-select/$', views.widget_select),
-
-    url(r'^widget-toggle/$', views.widget_toggle),
 ]

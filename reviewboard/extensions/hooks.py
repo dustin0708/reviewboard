@@ -1,12 +1,9 @@
 from __future__ import unicode_literals
 
-import inspect
 import logging
-import warnings
 
-from django.template.context import RequestContext
-from django.template.loader import render_to_string
 from django.utils import six
+from django.utils.translation import ugettext as _
 from djblets.extensions.hooks import (AppliesToURLMixin,
                                       BaseRegistryHook,
                                       BaseRegistryMultiItemHook,
@@ -17,7 +14,9 @@ from djblets.extensions.hooks import (AppliesToURLMixin,
                                       TemplateHook,
                                       URLHook)
 from djblets.integrations.hooks import BaseIntegrationHook
+from djblets.privacy.consent.hooks import ConsentRequirementHook
 from djblets.registries.errors import ItemLookupError
+from djblets.util.compat.django.template.loader import render_to_string
 
 from reviewboard.accounts.backends import auth_backends
 from reviewboard.accounts.pages import AccountPage
@@ -351,16 +350,27 @@ class HostingServiceHook(ExtensionHook):
                 The hosting service class to register. This must be a
                 subclass of
                 :py:class:`~reviewboard.hostingsvcs.service.HostingService`.
+
+        Raises:
+            ValueError:
+                The service's :py:attr:`~reviewboard.hostingsvcs.service
+                .HostingService.hosting_service_id` attribute was not set.
         """
-        self.name = service_cls.name
-        register_hosting_service(service_cls.name, service_cls)
+        hosting_service_id = service_cls.hosting_service_id
+
+        if hosting_service_id is None:
+            raise ValueError(_('%s.hosting_service_id must be set.')
+                             % (service_cls.__name__))
+
+        self.hosting_service_id = hosting_service_id
+        register_hosting_service(hosting_service_id, service_cls)
 
     def shutdown(self):
         """Shut down the hook.
 
         This will unregister the hosting service.
         """
-        unregister_hosting_service(self.name)
+        unregister_hosting_service(self.hosting_service_id)
 
 
 @six.add_metaclass(ExtensionHookPoint)
@@ -433,20 +443,6 @@ class NavigationBarHook(ExtensionHook):
         """
         self.entries = entries
         self.is_enabled_for = is_enabled_for
-
-        if callable(is_enabled_for):
-            argspec = inspect.getargspec(is_enabled_for)
-
-            if argspec.keywords is None:
-                warnings.warn(
-                    'NavigationBarHook.is_enabled_for is being passed '
-                    'a function without keyword arguments by %r. This '
-                    'is deprecated.'
-                    % self.extension,
-                    DeprecationWarning)
-
-                self.is_enabled_for = \
-                    lambda user, **kwargs: is_enabled_for(user)
 
     def get_entries(self, context):
         """Return the navigation bar entries defined in this hook.
@@ -1391,8 +1387,10 @@ class UserInfoboxHook(ExtensionHook):
         context.update(self.get_extra_context(user=user,
                                               request=request,
                                               local_site=local_site))
-        return render_to_string(self.template_name,
-                                RequestContext(request, context))
+        return render_to_string(
+            template_name=self.template_name,
+            context=context,
+            request=request)
 
 
 @six.add_metaclass(ExtensionHookPoint)
@@ -1889,6 +1887,7 @@ __all__ = [
     'AvatarServiceHook',
     'BaseReviewRequestActionHook',
     'CommentDetailDisplayHook',
+    'ConsentRequirementHook',
     'DashboardColumnsHook',
     'DashboardSidebarItemsHook',
     'DataGridColumnsHook',

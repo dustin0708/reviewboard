@@ -2,8 +2,8 @@
 
 const optionTemplate = _.template(dedent`
     <div>
-    <% if (useAvatars && avatarURL) { %>
-     <img src="<%- avatarURL %>">
+    <% if (useAvatars && avatarHTML) { %>
+     <%= avatarHTML %>
     <% } %>
     <% if (fullname) { %>
      <span class="title"><%- fullname %></span>
@@ -18,7 +18,7 @@ const optionTemplate = _.template(dedent`
 /**
  * A widget to select related users using search and autocomplete.
  */
-RB.RelatedUserSelectorView = RB.RelatedObjectSelectorView.extend({
+RB.RelatedUserSelectorView = Djblets.RelatedObjectSelectorView.extend({
     searchPlaceholderText: gettext('Search for users...'),
 
     /**
@@ -40,7 +40,7 @@ RB.RelatedUserSelectorView = RB.RelatedObjectSelectorView.extend({
      *         Whether to show avatars. Off by default.
      */
     initialize(options) {
-        RB.RelatedObjectSelectorView.prototype.initialize.call(
+        Djblets.RelatedObjectSelectorView.prototype.initialize.call(
             this,
             _.defaults({
                 selectizeOptions: {
@@ -90,8 +90,9 @@ RB.RelatedUserSelectorView = RB.RelatedObjectSelectorView.extend({
     loadOptions(query, callback) {
         const params = {
             fullname: 1,
-            'only-fields': 'avatar_urls,fullname,id,username',
+            'only-fields': 'avatar_html,fullname,id,username',
             'only-links': '',
+            'render-avatars-at': '20',
         };
 
         if (query.length !== 0) {
@@ -104,14 +105,14 @@ RB.RelatedUserSelectorView = RB.RelatedObjectSelectorView.extend({
             data: params,
             success(results) {
                 callback(results.users.map(u => ({
-                    avatarURL: u.avatar_urls && u.avatar_urls['1x'],
+                    avatarHTML: u.avatar_html[20],
                     fullname: u.fullname,
                     id: u.id,
                     username: u.username,
                 })));
             },
             error(...args) {
-                console.log('User query failed', args);
+                console.error('User query failed', args);
                 callback();
             },
         });

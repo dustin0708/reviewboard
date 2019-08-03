@@ -5,8 +5,10 @@ from __future__ import unicode_literals
 import os
 import re
 
+import django
 import djblets
 from django.core.urlresolvers import reverse
+from django.utils.encoding import force_str
 
 from reviewboard.dependencies import (dependency_error,
                                       fail_if_missing_dependencies)
@@ -49,14 +51,6 @@ SITE_ID = 1
 # The prefix for e-mail subjects sent to administrators.
 EMAIL_SUBJECT_PREFIX = "[Review Board] "
 
-# Whether to allow for smart spoofing of From addresses for e-mails.
-#
-# If enabled (default), DMARC records will be looked up before determining
-# whether to use the user's e-mail address as the From address.
-#
-# If disabled, the old, dumb approach of assuming we can spoof will be used.
-EMAIL_ENABLE_SMART_SPOOFING = True
-
 # Default name of the service used in From e-mail when not spoofing.
 #
 # This should generally not be overridden unless one needs to thoroughly
@@ -89,8 +83,9 @@ MIDDLEWARE_CLASSES = [
     'djblets.integrations.middleware.IntegrationsMiddleware',
     'djblets.log.middleware.LoggingMiddleware',
     'reviewboard.accounts.middleware.TimezoneMiddleware',
+    'reviewboard.accounts.middleware.UpdateLastLoginMiddleware',
     'reviewboard.admin.middleware.CheckUpdatesRequiredMiddleware',
-    'reviewboard.admin.middleware.X509AuthMiddleware',
+    'reviewboard.accounts.middleware.X509AuthMiddleware',
     'reviewboard.site.middleware.LocalSiteMiddleware',
 
     # Keep this second to last so that everything is initialized before
@@ -147,6 +142,7 @@ RB_BUILTIN_APPS = [
     'djblets.integrations',
     'djblets.log',
     'djblets.pipeline',
+    'djblets.privacy',
     'djblets.recaptcha',
     'djblets.siteconfig',
     'djblets.util',
@@ -198,6 +194,22 @@ WEB_API_ROOT_RESOURCE = 'reviewboard.webapi.resources.root.root_resource'
 
 SESSION_ENGINE = 'django.contrib.sessions.backends.cached_db'
 
+# A list of supported password hashers. This contains some old hashers we no
+# longer want to use to generate passwords, but are needed for legacy servers.
+#
+# This is current as of Django 1.11.
+PASSWORD_HASHERS = (
+    'django.contrib.auth.hashers.PBKDF2PasswordHasher',
+    'django.contrib.auth.hashers.PBKDF2SHA1PasswordHasher',
+    'django.contrib.auth.hashers.BCryptSHA256PasswordHasher',
+    'django.contrib.auth.hashers.BCryptPasswordHasher',
+    'django.contrib.auth.hashers.SHA1PasswordHasher',
+    'django.contrib.auth.hashers.MD5PasswordHasher',
+    'django.contrib.auth.hashers.UnsaltedSHA1PasswordHasher',
+    'django.contrib.auth.hashers.UnsaltedMD5PasswordHasher',
+    'django.contrib.auth.hashers.CryptPasswordHasher',
+)
+
 # Set up a default cache backend. This will mostly be useful for
 # local development, as sites will override this.
 #
@@ -229,7 +241,7 @@ CACHE_EXPIRATION_TIME = 60 * 60 * 24 * 30  # 1 month
 # runner, as well as some special features like a code coverage report.
 TEST_RUNNER = 'reviewboard.test.RBTestRunner'
 
-RUNNING_TEST = (os.environ.get('RB_RUNNING_TESTS') == '1')
+RUNNING_TEST = (os.environ.get(str('RB_RUNNING_TESTS')) == str('1'))
 
 
 LOCAL_ROOT = None
@@ -287,14 +299,19 @@ TEMPLATE_LOADERS = [
     ),
 ]
 
+if django.VERSION[:2] == (1, 6):
+    _template_context_processor = 'django.core.context_processors'
+else:
+    _template_context_processor = 'django.template.context_processors'
+
 TEMPLATE_CONTEXT_PROCESSORS = [
     'django.contrib.auth.context_processors.auth',
     'django.contrib.messages.context_processors.messages',
-    'django.core.context_processors.debug',
-    'django.core.context_processors.i18n',
-    'django.core.context_processors.media',
-    'django.core.context_processors.request',
-    'django.core.context_processors.static',
+    '%s.debug' % _template_context_processor,
+    '%s.i18n' % _template_context_processor,
+    '%s.media' % _template_context_processor,
+    '%s.request' % _template_context_processor,
+    '%s.static' % _template_context_processor,
     'djblets.cache.context_processors.ajax_serial',
     'djblets.cache.context_processors.media_serial',
     'djblets.siteconfig.context_processors.siteconfig',
@@ -341,6 +358,9 @@ TEMPLATES = [
         'BACKEND': 'django.template.backends.django.DjangoTemplates',
         'DIRS': TEMPLATE_DIRS,
         'OPTIONS': {
+            'builtins': [
+                'reviewboard.site.templatetags.localsite',
+            ],
             'context_processors': TEMPLATE_CONTEXT_PROCESSORS,
             'debug': DEBUG,
             'loaders': TEMPLATE_LOADERS,
@@ -387,6 +407,12 @@ HAYSTACK_CONNECTIONS = {
 
 HAYSTACK_SIGNAL_PROCESSOR = \
     'reviewboard.search.signal_processor.SignalProcessor'
+
+
+# Custom Django Evolutions for modules we use.
+CUSTOM_EVOLUTIONS = {
+    'oauth2_provider': 'reviewboard.admin.custom_evolutions.oauth2_provider',
+}
 
 # Make sure that we have a staticfiles cache set up for media generation.
 # By default, we want to store this in local memory and not memcached or
@@ -437,7 +463,7 @@ else:
     ]
 
 NODE_PATH = os.path.join(REVIEWBOARD_ROOT, '..', 'node_modules')
-os.environ['NODE_PATH'] = NODE_PATH
+os.environ[str('NODE_PATH')] = force_str(NODE_PATH)
 
 PIPELINE = {
     # On production (site-installed) builds, we always want to use the
@@ -451,14 +477,15 @@ PIPELINE = {
     'JS_COMPRESSOR': 'pipeline.compressors.uglifyjs.UglifyJSCompressor',
     'CSS_COMPRESSOR': None,
     'BABEL_BINARY': os.path.join(NODE_PATH, 'babel-cli', 'bin', 'babel.js'),
-    'BABEL_ARGUMENTS': ['--presets', 'es2015', '--plugins', 'dedent',
+    'BABEL_ARGUMENTS': ['--presets', 'env', '--plugins', 'dedent',
                         '-s', 'true'],
     'LESS_BINARY': os.path.join(NODE_PATH, 'less', 'bin', 'lessc'),
     'LESS_ARGUMENTS': [
         '--include-path=%s' % STATIC_ROOT,
         '--no-color',
         '--source-map',
-        '--autoprefix=> 2%, ie >= 9',
+        '--js',
+        '--autoprefix',
         # This is just here for backwards-compatibility with any stylesheets
         # that still have this. It's no longer necessary because compilation
         # happens on the back-end instead of in the browser.

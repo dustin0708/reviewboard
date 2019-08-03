@@ -20,8 +20,19 @@
 }
 
 .config-forms-container .config-forms-page-content {
+  .box-main {
+    > p,
+    form > p {
+      margin-top: 0;
+    }
+  }
+
   .config-forms-list-item {
     white-space: unset;
+  }
+
+  .help {
+    margin: 1em 2em;
   }
 }
 
@@ -82,6 +93,24 @@
       font-size: 90%;
       text-decoration: none;
     }
+  }
+}
+
+#page_groups {
+  .config-group-display-name {
+    color: #A0A0A0;
+    font-size: 90%;
+  }
+
+  .config-group-name {
+    display: inline-block;
+    min-width: 15em;
+    padding-right: 2em;
+  }
+
+  .config-forms-list-action-join,
+  .config-forms-list-action-leave {
+    min-width: 3em;
   }
 }
 

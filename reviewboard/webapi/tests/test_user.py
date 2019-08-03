@@ -34,9 +34,22 @@ class NoURLAvatarService(AvatarService):
         return {}
 
 
+class SimpleRenderAvatarService(NoURLAvatarService):
+    """An avatar services that has simple, testable rendered output."""
+
+    avatar_service_id = 'simple-renders'
+    name = 'Simple Renders'
+
+    def render(self, request, user, size, **kwargs):
+        return '<div class="avatar" data-size="%s">%s</div>' % (size,
+                                                                user.username)
+
+
 @six.add_metaclass(BasicTestsMetaclass)
-class ResourceListTests(SpyAgency, BaseWebAPITestCase):
+class ResourceListTests(AvatarServicesTestMixin, SpyAgency,
+                        BaseWebAPITestCase):
     """Testing the UserResource list API tests."""
+
     fixtures = ['test_users']
     sample_api_url = 'users/'
     resource = resources.user
@@ -125,49 +138,97 @@ class ResourceListTests(SpyAgency, BaseWebAPITestCase):
         self.assertEqual(rsp['stat'], 'ok')
         self.assertEqual(len(rsp['users']), 1)  # grumpy
 
-    def test_query_users_auth_backend(self):
-        """Testing the GET users/?q= API
-        with AuthBackend.query_users failure
+    @webapi_test_template
+    def test_get_with_render_avatars_at(self):
+        """Testing the GET <URL> API with ?render-avatars-at=..."""
+        avatar_services.register(SimpleRenderAvatarService)
+        avatar_services.enable_service(SimpleRenderAvatarService, save=False)
+        avatar_services.set_default_service(SimpleRenderAvatarService)
+
+        rsp = self.api_get(
+            get_user_list_url(),
+            {
+                'render-avatars-at': '24,abc,48,,128',
+            },
+            expected_mimetype=user_list_mimetype)
+
+        self.assertEqual(rsp['stat'], 'ok')
+        self.assertEqual(len(rsp['users']), 4)
+        self.assertEqual(
+            rsp['users'][0]['avatar_html'],
+            {
+                '24': '<div class="avatar" data-size="24">admin</div>',
+                '48': '<div class="avatar" data-size="48">admin</div>',
+                '128': '<div class="avatar" data-size="128">admin</div>',
+            })
+
+        self.assertEqual(
+            rsp['users'][1]['avatar_html'],
+            {
+                '24': '<div class="avatar" data-size="24">doc</div>',
+                '48': '<div class="avatar" data-size="48">doc</div>',
+                '128': '<div class="avatar" data-size="128">doc</div>',
+            })
+
+        self.assertEqual(
+            rsp['users'][2]['avatar_html'],
+            {
+                '24': '<div class="avatar" data-size="24">dopey</div>',
+                '48': '<div class="avatar" data-size="48">dopey</div>',
+                '128': '<div class="avatar" data-size="128">dopey</div>',
+            })
+
+        self.assertEqual(
+            rsp['users'][3]['avatar_html'],
+            {
+                '24': '<div class="avatar" data-size="24">grumpy</div>',
+                '48': '<div class="avatar" data-size="48">grumpy</div>',
+                '128': '<div class="avatar" data-size="128">grumpy</div>',
+            })
+
+    def test_populate_users_auth_backend(self):
+        """Testing the GET users/?q= API with BaseAuthBackend.populate_users
+        failure
         """
         class SandboxAuthBackend(AuthBackend):
             backend_id = 'test-id'
             name = 'test'
 
-            def query_users(self, query, request):
+            def populate_users(self, query, request, **kwargs):
                 raise Exception
 
         backend = SandboxAuthBackend()
 
         self.spy_on(get_enabled_auth_backends, call_fake=lambda: [backend])
-        self.spy_on(backend.query_users)
+        self.spy_on(backend.populate_users)
 
         rsp = self.api_get(get_user_list_url(), {'q': 'gru'},
                            expected_mimetype=user_list_mimetype)
         self.assertEqual(rsp['stat'], 'ok')
 
-        self.assertTrue(backend.query_users.called)
+        self.assertTrue(backend.populate_users.called)
 
-    def test_search_users_auth_backend(self):
-        """Testing the GET users/?q= API
-        with AuthBackend.search_users failure
+    def test_build_search_users_query_auth_backend(self):
+        """Testing the GET users/?q= API with
+        BaseAuthBackend.build_search_users_query failure
         """
         class SandboxAuthBackend(AuthBackend):
             backend_id = 'test-id'
             name = 'test'
 
-            def search_users(self, query, request):
+            def build_search_users_query(self, query, request, **kwargs):
                 raise Exception
 
         backend = SandboxAuthBackend()
 
         self.spy_on(get_enabled_auth_backends, call_fake=lambda: [backend])
-        self.spy_on(backend.search_users)
+        self.spy_on(backend.build_search_users_query)
 
         rsp = self.api_get(get_user_list_url(), {'q': 'gru'},
                            expected_mimetype=user_list_mimetype)
         self.assertEqual(rsp['stat'], 'ok')
 
-        self.assertTrue(backend.search_users.called)
+        self.assertTrue(backend.build_search_users_query.called)
 
     #
     # HTTP POST tests
@@ -306,6 +367,34 @@ class ResourceListTests(SpyAgency, BaseWebAPITestCase):
         self.assertIn('fields', rsp)
         self.assertIn('email', rsp['fields'])
 
+    @webapi_test_template
+    def test_post_with_render_avatars_at(self):
+        """Testing the POST <URL> API with render_avatars_at=..."""
+        self.client.login(username='admin', password='admin')
+
+        avatar_services.register(SimpleRenderAvatarService)
+        avatar_services.enable_service(SimpleRenderAvatarService, save=False)
+        avatar_services.set_default_service(SimpleRenderAvatarService)
+
+        rsp = self.api_post(
+            get_user_list_url(),
+            {
+                'username': 'myuser',
+                'password': 'mypass',
+                'email': 'myuser@example.com',
+                'render_avatars_at': '24,abc,48,,128',
+            },
+            expected_mimetype=user_item_mimetype)
+
+        self.assertEqual(rsp['stat'], 'ok')
+        self.assertEqual(
+            rsp['user']['avatar_html'],
+            {
+                '24': '<div class="avatar" data-size="24">myuser</div>',
+                '48': '<div class="avatar" data-size="48">myuser</div>',
+                '128': '<div class="avatar" data-size="128">myuser</div>',
+            })
+
 
 @six.add_metaclass(BasicTestsMetaclass)
 class ResourceItemTests(AvatarServicesTestMixin, BaseWebAPITestCase):
@@ -336,6 +425,9 @@ class ResourceItemTests(AvatarServicesTestMixin, BaseWebAPITestCase):
         self.assertIn('1x', item_rsp['avatar_urls'])
         self.assertIn('2x', item_rsp['avatar_urls'])
 
+        # By default, avatars are not rendered.
+        self.assertIsNone(item_rsp['avatar_html'])
+
     #
     # HTTP GET tests
     #
@@ -350,19 +442,19 @@ class ResourceItemTests(AvatarServicesTestMixin, BaseWebAPITestCase):
         self._testHttpCaching(get_user_item_url('doc'),
                               check_etags=True)
 
-    @add_fixtures(['test_site'])
     def test_get_with_site_and_profile_private(self):
-        """Testing the GET users/<username>/ API
-        with a local site and private profile
+        """Testing the GET users/<username>/ API with a local site and private
+        profile
         """
-        self._login_user(local_site=True)
-
         username = 'admin'
         user = User.objects.get(username=username)
 
-        profile, is_new = Profile.objects.get_or_create(user=user)
+        site = LocalSite.objects.create(name=self.local_site_name)
+        site.users = [user, self.user]
+
+        profile = user.get_profile()
         profile.is_private = True
-        profile.save()
+        profile.save(update_fields=('is_private',))
 
         rsp = self.api_get(get_user_item_url(username, self.local_site_name),
                            expected_mimetype=user_item_mimetype)
@@ -371,6 +463,29 @@ class ResourceItemTests(AvatarServicesTestMixin, BaseWebAPITestCase):
         self.assertNotIn('first_name', rsp['user'])
         self.assertNotIn('last_name', rsp['user'])
         self.assertNotIn('email', rsp['user'])
+
+    @add_fixtures(['test_site'])
+    def test_get_with_site_and_profile_private_as_site_admin(self):
+        """Testing the GET users/<username>/ API with a local site and private
+        profile as a LocalSite admin
+        """
+        self._login_user(local_site=True)
+
+        username = 'admin'
+        user = User.objects.get(username=username)
+
+        profile = user.get_profile()
+        profile.is_private = True
+        profile.save(update_fields=('is_private',))
+
+        rsp = self.api_get(get_user_item_url(username, self.local_site_name),
+                           expected_mimetype=user_item_mimetype)
+        self.assertEqual(rsp['stat'], 'ok')
+        item_rsp = rsp['user']
+        self.assertEqual(item_rsp['username'], user.username)
+        self.assertEqual(item_rsp['first_name'], user.first_name)
+        self.assertEqual(item_rsp['last_name'], user.last_name)
+        self.assertEqual(item_rsp['email'], user.email)
 
     @add_fixtures(['test_site'])
     def test_get_missing_user_with_site(self):
@@ -386,9 +501,9 @@ class ResourceItemTests(AvatarServicesTestMixin, BaseWebAPITestCase):
         username = 'dopey'
         user = User.objects.get(username=username)
 
-        profile, is_new = Profile.objects.get_or_create(user=user)
+        profile = user.get_profile()
         profile.is_private = True
-        profile.save()
+        profile.save(update_fields=('is_private',))
 
         rsp = self.api_get(
             '%s?only-fields=username' % get_user_item_url(username),
@@ -433,3 +548,26 @@ class ResourceItemTests(AvatarServicesTestMixin, BaseWebAPITestCase):
         self.assertIsNone(user_rsp['avatar_url'])
         self.assertIn('avatar_urls', user_rsp)
         self.assertEqual(user_rsp['avatar_urls'], {})
+
+    @webapi_test_template
+    def test_get_with_render_avatars_at(self):
+        """Testing the GET <URL> API with ?render-avatars-at=..."""
+        avatar_services.register(SimpleRenderAvatarService)
+        avatar_services.enable_service(SimpleRenderAvatarService, save=False)
+        avatar_services.set_default_service(SimpleRenderAvatarService)
+
+        rsp = self.api_get(
+            get_user_item_url('dopey'),
+            {
+                'render-avatars-at': '24,abc,48,,128',
+            },
+            expected_mimetype=user_item_mimetype)
+
+        self.assertEqual(rsp['stat'], 'ok')
+        self.assertEqual(
+            rsp['user']['avatar_html'],
+            {
+                '24': '<div class="avatar" data-size="24">dopey</div>',
+                '48': '<div class="avatar" data-size="48">dopey</div>',
+                '128': '<div class="avatar" data-size="128">dopey</div>',
+            })

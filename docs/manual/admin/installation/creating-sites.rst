@@ -69,7 +69,7 @@ username may depend on your choice of operating system)::
 Next, as the postgres user, create a database and a user to access it::
 
     $ createdb reviewboard
-    $ createuser -P
+    $ createuser -P --interactive
 
 The second of these commands will ask you several questions. For the last three
 questions (relating to permissions), reply 'n'.
@@ -234,6 +234,11 @@ try going to your site.
    process to be able to send email, access the caching server,
    connect to a remote database server and support uploading diffs,
    respectively.
+
+   Additionally, if you are using Review Board with a remote LDAP
+   server, you should also run (as root)::
+
+      $ setsebool -P httpd_can_connect_ldap 1
 
 lighttpd
 --------

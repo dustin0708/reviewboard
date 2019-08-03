@@ -310,7 +310,7 @@ class Site(object):
         # Make sure that we have our settings_local.py in our path for when
         # we need to run manager commands.
         sys.path.insert(0, os.path.join(self.abs_install_dir, "conf"))
-        os.environ[b'DJANGO_SETTINGS_MODULE'] = b'reviewboard.settings'
+        os.environ[str('DJANGO_SETTINGS_MODULE')] = str('reviewboard.settings')
 
     def get_apache_version(self):
         """Return the version of the installed apache."""
@@ -515,7 +515,7 @@ class Site(object):
         from reviewboard.diffviewer.models import FileDiff
 
         try:
-            return FileDiff.objects.unmigrated().count() > 0
+            return FileDiff.objects.unmigrated().exists()
         except:
             # Very likely, there was no diffviewer_filediff.diff_hash_id
             # column, indicating a pre-1.7 database. We want to assume
@@ -541,6 +541,22 @@ class Site(object):
                              "Cannot determine if upgrade is needed.\n")
 
         return False
+
+    def get_wsgi_upgrade_needed(self):
+        """Return whether a reviewboard.wsgi upgrade is needed.
+
+        Returns:
+            bool:
+            ``True`` if the :file:`reviewboard.wsgi` file needs to be upgraded.
+            ``False`` if it does not.
+        """
+        filename = os.path.join(self.abs_install_dir, 'htdocs',
+                                'reviewboard.wsgi')
+
+        with open(filename, 'r') as fp:
+            data = fp.read()
+
+        return 'django.core.handlers.wsgi.WSGIHandler' in data
 
     def upgrade_settings(self):
         """Perform a settings upgrade."""
@@ -645,6 +661,28 @@ class Site(object):
         import django.conf
         django.conf.settings = django.conf.LazySettings()
 
+    def upgrade_wsgi(self):
+        """Upgrade the reviewboard.wsgi file.
+
+        This will modify :file:`reviewboard.wsgi` to replace any old
+        WSGI initialization logic with modern logic.
+        """
+        filename = os.path.join(self.abs_install_dir, 'htdocs',
+                                'reviewboard.wsgi')
+
+        with open(filename, 'r') as fp:
+            data = fp.read()
+
+        data = data.replace(
+            'import django.core.handlers.wsgi',
+            'from django.core.wsgi import get_wsgi_application')
+        data = data.replace(
+            'application = django.core.handlers.wsgi.WSGIHandler()',
+            'application = get_wsgi_application()')
+
+        with open(filename, 'w') as fp:
+            fp.write(data)
+
     def create_admin_user(self):
         """Create an administrator user account."""
         from django.contrib.auth.models import User
@@ -682,8 +720,8 @@ class Site(object):
             from django.core.management import (execute_from_command_line,
                                                 get_commands)
 
-            os.environ.setdefault(b'DJANGO_SETTINGS_MODULE',
-                                  b'reviewboard.settings')
+            os.environ.setdefault(str('DJANGO_SETTINGS_MODULE'),
+                                  str('reviewboard.settings'))
 
             if not params:
                 params = []
@@ -1752,6 +1790,10 @@ class UpgradeCommand(Command):
         if site.get_settings_upgrade_needed():
             print("Upgrading site settings_local.py")
             site.upgrade_settings()
+
+        if site.get_wsgi_upgrade_needed():
+            print('Upgrading site reviewboard.wsgi')
+            site.upgrade_wsgi()
 
         if options.upgrade_db:
             print("Updating database. This may take a while.\n"

@@ -16,6 +16,7 @@ from reviewboard.accounts.forms.pages import (AccountSettingsForm,
                                               APITokensForm,
                                               AvatarSettingsForm,
                                               ChangePasswordForm,
+                                              PrivacyForm,
                                               GroupsForm,
                                               OAuthApplicationsForm,
                                               OAuthTokensForm,
@@ -33,7 +34,7 @@ class AccountPageRegistry(ExceptionFreeGetterMixin, ConfigPageRegistry):
         Returns:
             type: The page classes, as subclasses of :py:class:`AccountPage`.
         """
-        return (ProfilePage, AccountSettingsPage, GroupsPage,
+        return (PrivacyPage, ProfilePage, AccountSettingsPage, GroupsPage,
                 AuthenticationPage, OAuth2Page)
 
     def unregister(self, page_class):
@@ -128,72 +129,9 @@ class OAuth2Page(AccountPage):
     form_classes = [OAuthApplicationsForm]
 
 
-def register_account_page_class(cls):
-    """Register a custom account page class.
+class PrivacyPage(AccountPage):
+    """A page containing information on a user's privacy rights."""
 
-    A page ID is considered unique and can only be registered once.
-
-    Args:
-        cls (type):
-            The page class to register, as a subclass of
-            :py:class:`AccountPage`.
-
-    Raises:
-        djblets.registries.errors.AlreadyRegisteredError:
-            Raised if the page or any of its forms have already been
-            registered.
-
-        djblets.registries.errors.RegistrationError:
-            Raised if the page shares an attribute with an already
-            registered page or if any of its forms share an attribute
-            with an already registered form.
-    """
-    warn('register_account_page_class is deprecated in Review Board 3.0 and '
-         'will be removed; use AccountPage.registry.register instead.',
-         DeprecationWarning)
-    AccountPage.registry.register(cls)
-
-
-def unregister_account_page_class(page_cls):
-    """Unregister a previously registered account page class.
-
-    Args:
-        page_cls (type):
-            The page class to unregister, as a subclass of
-            :py:class:`AccountPage`.
-    """
-    warn('unregister_account_page_class is deprecated in Review Board 3.0 and '
-         'will be removed; use AccountPage.registry.unregister instead.',
-         DeprecationWarning)
-    AccountPage.registry.unregister(page_cls)
-
-
-def get_page_class(page_id):
-    """Return the account page class with the specified ID.
-
-    Args:
-        page_id (unicode):
-            The page's unique identifier.
-
-    Returns:
-        type:
-        The :py:class:`AccountPage` subclass, or ``None`` if it could not be
-        found.
-    """
-    warn('get_page_class is deprecated in Review Board 3.0 and will be '
-         'removed; use AccountPage.registry.get instead.',
-         DeprecationWarning)
-    return AccountPage.registry.get('page_id', page_id)
-
-
-def get_page_classes():
-    """Yield all registered page classes.
-
-    Yields:
-        type: Each registered page class, as a subclass of
-        :py:class:`AccountPage`.
-    """
-    warn('get_page_classes is deprecated in Review Board 3.0 and will be '
-         'removed; iterate through AccountPage.registry instead.',
-         DeprecationWarning)
-    return iter(AccountPage.registry)
+    page_id = 'privacy'
+    page_title = _('My Privacy Rights')
+    form_classes = [PrivacyForm]

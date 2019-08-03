@@ -2,7 +2,10 @@ from __future__ import unicode_literals
 
 import os
 
+from django.contrib.auth.models import AnonymousUser
 from django.core.cache import cache
+from django.core.exceptions import ValidationError
+from djblets.testing.decorators import add_fixtures
 
 from reviewboard.scmtools.core import HEAD
 from reviewboard.scmtools.models import Repository, Tool
@@ -69,6 +72,67 @@ class RepositoryTests(TestCase):
         self.assertNotEqual(repository.archived_timestamp,
                             self.repository.archived_timestamp)
 
+    def test_clean_without_conflict(self):
+        """Testing Repository.clean without name/path conflicts"""
+        with self.assertNumQueries(1):
+            self.repository.clean()
+
+    def test_clean_with_name_conflict(self):
+        """Testing Repository.clean with name conflict"""
+        repository = Repository(name=self.repository.name,
+                                path='path/to/repo.git',
+                                tool=self.repository.tool)
+
+        with self.assertRaises(ValidationError) as ctx:
+            with self.assertNumQueries(1):
+                repository.clean()
+
+        self.assertEqual(ctx.exception.message_dict, {
+            'name': ['A repository with this name already exists'],
+        })
+
+    def test_clean_with_path_conflict(self):
+        """Testing Repository.clean with path conflict"""
+        repository = Repository(name='New test repo',
+                                path=self.repository.path,
+                                tool=self.repository.tool)
+
+        with self.assertRaises(ValidationError) as ctx:
+            with self.assertNumQueries(1):
+                repository.clean()
+
+        self.assertEqual(ctx.exception.message_dict, {
+            'path': ['A repository with this path already exists'],
+        })
+
+    def test_clean_with_name_and_path_conflict(self):
+        """Testing Repository.clean with name and path conflict"""
+        repository = Repository(name=self.repository.name,
+                                path=self.repository.path,
+                                tool=self.repository.tool)
+
+        with self.assertRaises(ValidationError) as ctx:
+            with self.assertNumQueries(1):
+                repository.clean()
+
+        self.assertEqual(ctx.exception.message_dict, {
+            'name': ['A repository with this name already exists'],
+            'path': ['A repository with this path already exists'],
+        })
+
+    def test_clean_with_path_conflict_with_archived(self):
+        """Testing Repository.clean with archived repositories ignored for
+        path conflict
+        """
+        self.repository.archive()
+
+        repository = Repository(name='New test repo',
+                                path=self.repository.path,
+                                tool=self.repository.tool)
+
+        with self.assertNumQueries(1):
+            repository.clean()
+
     def test_get_file_caching(self):
         """Testing Repository.get_file caches result"""
         def get_file(self, path, revision, **kwargs):
@@ -88,7 +152,9 @@ class RepositoryTests(TestCase):
         data1 = self.repository.get_file(path, revision, request=request)
         data2 = self.repository.get_file(path, revision, request=request)
 
-        self.assertEqual(data1, 'file data')
+        self.assertIsInstance(data1, bytes)
+        self.assertIsInstance(data2, bytes)
+        self.assertEqual(data1, b'file data')
         self.assertEqual(data1, data2)
         self.assertEqual(num_calls['get_file'], 1)
 
@@ -173,7 +239,7 @@ class RepositoryTests(TestCase):
         """Testing Repository.get_file_exists uses get_file's cached result"""
         def get_file(self, path, revision, **kwargs):
             num_calls['get_file'] += 1
-            return 'file data'
+            return b'file data'
 
         def file_exists(self, path, revision, **kwargs):
             num_calls['get_file_exists'] += 1
@@ -229,38 +295,140 @@ class RepositoryTests(TestCase):
         self.assertEqual(found_signals[1],
                          ('checked_file_exists', path, revision, request))
 
-    def test_get_file_signature_warning(self):
-        """Test old SCMTool.get_file signature triggers warning"""
-        def get_file(self, path, revision):
-            return 'file data'
+    def test_repository_name_with_255_characters(self):
+        """Testing Repository.name with 255 characters"""
+        self.repository = Repository.objects.create(
+            name='t' * 255,
+            path=self.local_repo_path,
+            tool=Tool.objects.get(name='Git'))
 
-        self.scmtool_cls.get_file = get_file
+        self.assertEqual(len(self.repository.name), 255)
 
-        path = 'readme'
-        revision = 'e965047'
-        request = {}
+    def test_is_accessible_by_with_public(self):
+        """Testing Repository.is_accessible_by with public repository"""
+        user = self.create_user()
+        repository = self.create_repository()
 
-        warn_msg = ('SCMTool.get_file() must take keyword arguments, '
-                    'signature for %s is deprecated.' %
-                    self.repository.get_scmtool().name)
+        self.assertTrue(repository.is_accessible_by(user))
+        self.assertTrue(repository.is_accessible_by(AnonymousUser()))
 
-        with self.assert_warns(message=warn_msg):
-            self.repository.get_file(path, revision, request=request)
+    def test_is_accessible_by_with_public_and_hidden(self):
+        """Testing Repository.is_accessible_by with public hidden repository"""
+        user = self.create_user()
+        repository = self.create_repository(visible=False)
 
-    def test_file_exists_signature_warning(self):
-        """Test old SCMTool.file_exists signature triggers warning"""
-        def file_exists(self, path, revision=HEAD):
-            return True
+        self.assertTrue(repository.is_accessible_by(user))
+        self.assertTrue(repository.is_accessible_by(AnonymousUser()))
 
-        self.scmtool_cls.file_exists = file_exists
+    def test_is_accessible_by_with_private_and_not_member(self):
+        """Testing Repository.is_accessible_by with private repository and
+        user not a member
+        """
+        user = self.create_user()
+        repository = self.create_repository(public=False)
 
-        path = 'readme'
-        revision = 'e965047'
-        request = {}
+        self.assertFalse(repository.is_accessible_by(user))
+        self.assertFalse(repository.is_accessible_by(AnonymousUser()))
 
-        warn_msg = ('SCMTool.file_exists() must take keyword arguments, '
-                    'signature for %s is deprecated.' %
-                    self.repository.get_scmtool().name)
+    def test_is_accessible_by_with_private_and_member(self):
+        """Testing Repository.is_accessible_by with private repository and
+        user is a member
+        """
+        user = self.create_user()
+        repository = self.create_repository(public=False)
+        repository.users.add(user)
 
-        with self.assert_warns(message=warn_msg):
-            self.repository.get_file_exists(path, revision, request=request)
+        self.assertTrue(repository.is_accessible_by(user))
+
+    def test_is_accessible_by_with_private_and_member_by_group(self):
+        """Testing Repository.is_accessible_by with private repository and
+        user is a member by group
+        """
+        user = self.create_user()
+
+        group = self.create_review_group(invite_only=True)
+        group.users.add(user)
+
+        repository = self.create_repository(public=False)
+        repository.review_groups.add(group)
+
+        self.assertTrue(repository.is_accessible_by(user))
+
+    def test_is_accessible_by_with_private_and_superuser(self):
+        """Testing Repository.is_accessible_by with private repository and
+        user is a superuser
+        """
+        user = self.create_user(is_superuser=True)
+        repository = self.create_repository(public=False)
+
+        self.assertTrue(repository.is_accessible_by(user))
+
+    def test_is_accessible_by_with_private_hidden_not_member(self):
+        """Testing Repository.is_accessible_by with private hidden
+        repository and user not a member
+        """
+        user = self.create_user()
+        repository = self.create_repository(public=False,
+                                            visible=False)
+
+        self.assertFalse(repository.is_accessible_by(user))
+
+    def test_is_accessible_by_with_private_hidden_and_member(self):
+        """Testing Repository.is_accessible_by with private hidden
+        repository and user is a member
+        """
+        user = self.create_user()
+
+        repository = self.create_repository(public=False,
+                                            visible=False)
+        repository.users.add(user)
+
+        self.assertTrue(repository.is_accessible_by(user))
+
+    def test_is_accessible_by_with_private_hidden_and_member_by_group(self):
+        """Testing Repository.is_accessible_by with private hidden
+        repository and user is a member
+        """
+        user = self.create_user()
+
+        group = self.create_review_group(invite_only=True)
+        group.users.add(user)
+
+        repository = self.create_repository(public=False,
+                                            visible=False)
+        repository.review_groups.add(group)
+
+        self.assertTrue(repository.is_accessible_by(user))
+
+    def test_is_accessible_by_with_private_hidden_and_superuser(self):
+        """Testing Repository.is_accessible_by with private hidden
+        repository and superuser
+        """
+        user = self.create_user(is_superuser=True)
+        repository = self.create_repository(public=False,
+                                            visible=False)
+
+        self.assertTrue(repository.is_accessible_by(user))
+
+    @add_fixtures(['test_users', 'test_site'])
+    def test_is_accessible_by_with_local_site_accessible(self):
+        """Testing Repository.is_accessible_by with Local Site accessible by
+        user
+        """
+        user = self.create_user()
+
+        repository = self.create_repository(with_local_site=True)
+        repository.local_site.users.add(user)
+
+        self.assertTrue(repository.is_accessible_by(user))
+
+    @add_fixtures(['test_users', 'test_site'])
+    def test_is_accessible_by_with_local_site_not_accessible(self):
+        """Testing Repository.is_accessible_by with Local Site not accessible
+        by user
+        """
+        user = self.create_user()
+        repository = self.create_repository(with_local_site=True)
+
+        self.assertFalse(repository.is_accessible_by(user))
+        self.assertFalse(repository.is_accessible_by(AnonymousUser()))

@@ -117,7 +117,7 @@ class ResourceListTests(BaseRepositoryTests):
         self.create_repository(name='test2', tool_name='Test', visible=True)
 
         rsp = self.api_get(get_repository_list_url(),
-                           query={'show-invisible': True},
+                           data={'show-invisible': True},
                            expected_mimetype=repository_list_mimetype)
         self.assertEqual(rsp['stat'], 'ok')
         self.assertEqual(len(rsp['repositories']), 2)
@@ -521,7 +521,7 @@ class ResourceListTests(BaseRepositoryTests):
                 raise UnverifiedCertificateError(cert)
 
         @classmethod
-        def _accept_certificate(cls, path, local_site_name=None):
+        def _accept_certificate(cls, path, local_site_name=None, **kwargs):
             saw['accept_certificate'] = True
             return {
                 'fingerprint': '123',
@@ -650,7 +650,7 @@ class ResourceItemTests(BaseRepositoryTests):
         repo_id = self._delete_repository(False, with_review_request=True)
 
         repo = Repository.objects.get(pk=repo_id)
-        self.assertFalse(repo.visible)
+        self.assertTrue(repo.archived)
 
     def test_delete_empty_repository(self):
         """Testing the DELETE repositories/<id>/ API with no review requests"""
@@ -667,7 +667,7 @@ class ResourceItemTests(BaseRepositoryTests):
         repo_id = self._delete_repository(True, with_review_request=True)
 
         repo = Repository.objects.get(pk=repo_id)
-        self.assertFalse(repo.visible)
+        self.assertTrue(repo.archived)
 
     @add_fixtures(['test_site'])
     def test_delete_empty_repository_with_site(self):

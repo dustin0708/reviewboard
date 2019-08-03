@@ -2,7 +2,7 @@ from __future__ import unicode_literals
 
 from kgb import SpyAgency
 
-from reviewboard.diffviewer.models import DiffSet, FileDiff
+from reviewboard.diffviewer.models import DiffSet, DiffSetHistory, FileDiff
 from reviewboard.testing import TestCase
 
 
@@ -21,7 +21,7 @@ class DiffSetManagerTests(SpyAgency, TestCase):
         diffset = DiffSet.objects.create_from_data(
             repository=repository,
             diff_file_name='diff',
-            diff_file_contents=self.DEFAULT_GIT_FILEDIFF_DATA,
+            diff_file_contents=self.DEFAULT_GIT_FILEDIFF_DATA_DIFF,
             basedir='/')
 
         self.assertEqual(diffset.files.count(), 1)
@@ -38,7 +38,7 @@ class DiffSetManagerTests(SpyAgency, TestCase):
         diffset = DiffSet.objects.create_from_data(
             repository=repository,
             diff_file_name='diff',
-            diff_file_contents=self.DEFAULT_GIT_FILEDIFF_DATA,
+            diff_file_contents=self.DEFAULT_GIT_FILEDIFF_DATA_DIFF,
             basedir='trunk/')
 
         self.assertEqual(diffset.files.count(), 1)
@@ -59,7 +59,7 @@ class DiffSetManagerTests(SpyAgency, TestCase):
         diffset = DiffSet.objects.create_from_data(
             repository=repository,
             diff_file_name='diff',
-            diff_file_contents=self.DEFAULT_GIT_FILEDIFF_DATA,
+            diff_file_contents=self.DEFAULT_GIT_FILEDIFF_DATA_DIFF,
             basedir='/trunk/')
 
         self.assertEqual(diffset.files.count(), 1)
@@ -79,10 +79,47 @@ class DiffSetManagerTests(SpyAgency, TestCase):
             diffset = DiffSet.objects.create_from_data(
                 repository=repository,
                 diff_file_name='diff',
-                diff_file_contents=self.DEFAULT_GIT_FILEDIFF_DATA,
+                diff_file_contents=self.DEFAULT_GIT_FILEDIFF_DATA_DIFF,
                 basedir='/',
                 validate_only=True)
 
         self.assertIsNone(diffset)
         self.assertEqual(DiffSet.objects.count(), 0)
         self.assertEqual(FileDiff.objects.count(), 0)
+
+    def test_create_empty(self):
+        """Testing DiffSetManager.create_empty"""
+        repository = self.create_repository(tool_name='Test')
+        history = DiffSetHistory.objects.create()
+
+        diffset = DiffSet.objects.create_empty(
+            repository=repository,
+            diffset_history=history)
+
+        self.assertEqual(diffset.files.count(), 0)
+        self.assertEqual(diffset.revision, 1)
+
+    def test_create_empty_with_revision(self):
+        """Testing DiffSetManager.create_empty with revision"""
+        repository = self.create_repository(tool_name='Test')
+        history = DiffSetHistory.objects.create()
+
+        diffset = DiffSet.objects.create_empty(
+            repository=repository,
+            diffset_history=history,
+            revision=10)
+
+        self.assertEqual(diffset.files.count(), 0)
+        self.assertEqual(diffset.history, history)
+        self.assertEqual(diffset.revision, 10)
+
+    def test_create_empty_without_history(self):
+        """Testing DiffSetManager.create_empty without diffset_history"""
+        repository = self.create_repository(tool_name='Test')
+
+        diffset = DiffSet.objects.create_empty(
+            repository=repository)
+
+        self.assertEqual(diffset.files.count(), 0)
+        self.assertIsNone(diffset.history)
+        self.assertEqual(diffset.revision, 0)

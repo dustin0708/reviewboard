@@ -1,9 +1,12 @@
 from __future__ import unicode_literals
 
+from functools import cmp_to_key
+
 from django.utils import six
 from django.utils.translation import ugettext as _
 from django.template.defaultfilters import truncatechars
 from djblets.siteconfig.models import SiteConfiguration
+from djblets.util.compat.python.past import cmp
 
 from reviewboard.accounts.models import ReviewRequestVisit
 from reviewboard.admin.server import build_server_url
@@ -48,7 +51,7 @@ def comment_counts(user, all_comments, filediff, interfilediff=None):
     for comment in comments:
         review = comment.get_review()
 
-        if review and (review.public or review.user == user):
+        if review and (review.public or review.user_id == user.pk):
             key = (comment.first_line, comment.num_lines)
 
             comment_dict.setdefault(key, []).append({
@@ -84,9 +87,10 @@ def comment_counts(user, all_comments, filediff, interfilediff=None):
             'comments': value,
         })
 
-    comments_array.sort(
-        cmp=lambda x, y: (cmp(x['linenum'], y['linenum'] or
-                          cmp(x['num_lines'], y['num_lines']))))
+    comments_array.sort(key=cmp_to_key(
+        lambda x, y: cmp(x['linenum'],
+                         y['linenum'] or cmp(x['num_lines'],
+                                             y['num_lines']))))
 
     return comments_array
 
@@ -194,7 +198,7 @@ def has_comments_in_diffsets_excluding(review, diffset_pair):
         # The user is browsing a standard diffset, so filter it out.
         q = q.exclude(pk=current_diffset.id)
 
-    if q.count() > 0:
+    if q.exists():
         return True
 
     # See if there are any interdiffs with comments on them in this review.
@@ -206,7 +210,7 @@ def has_comments_in_diffsets_excluding(review, diffset_pair):
         q = q.exclude(pk=current_diffset.id,
                       files__comments__interfilediff__diffset=interdiff)
 
-    return q.count() > 0
+    return q.exists()
 
 
 def diffsets_with_comments(review, current_pair):

@@ -8,28 +8,32 @@ import shutil
 import subprocess
 import tempfile
 from difflib import SequenceMatcher
+from functools import cmp_to_key
 
 from django.core.exceptions import ObjectDoesNotExist
 from django.utils import six
+from django.utils.encoding import force_text
 from django.utils.translation import ugettext as _
 from djblets.log import log_timed
 from djblets.siteconfig.models import SiteConfiguration
+from djblets.util.compat.python.past import cmp
 from djblets.util.contextmanagers import controlled_subprocess
 
-from reviewboard.diffviewer.errors import PatchError
+from reviewboard.diffviewer.commit_utils import exclude_ancestor_filediffs
+from reviewboard.diffviewer.errors import DiffTooBigError, PatchError
 from reviewboard.scmtools.core import PRE_CREATION, HEAD
 
 
 CHUNK_RANGE_RE = re.compile(
-    r'^@@ -(?P<orig_start>\d+)(,(?P<orig_len>\d+))? '
-    r'\+(?P<modified_start>\d+)(,(?P<modified_len>\d+))? @@',
+    br'^@@ -(?P<orig_start>\d+)(,(?P<orig_len>\d+))? '
+    br'\+(?P<modified_start>\d+)(,(?P<modified_len>\d+))? @@',
     re.M)
 
-NEWLINE_CONVERSION_RE = re.compile(r'\r(\r?\n)?')
-NEWLINE_RE = re.compile(r'(?:\n|\r(?:\r?\n)?)')
+NEWLINE_CONVERSION_BYTES_RE = re.compile(br'\r(\r?\n)?')
+NEWLINE_CONVERSION_UNICODE_RE = re.compile(r'\r(\r?\n)?')
+NEWLINE_RE = re.compile(br'(?:\n|\r(?:\r?\n)?)')
 
-ALPHANUM_RE = re.compile(r'\w')
-WHITESPACE_RE = re.compile(r'\s')
+_PATCH_GARBAGE_INPUT = 'patch: **** Only garbage was found in the patch input.'
 
 
 def convert_to_unicode(s, encoding_list):
@@ -53,7 +57,7 @@ def convert_to_unicode(s, encoding_list):
     if isinstance(s, six.text_type):
         # Nothing to do
         return 'utf-8', s
-    elif isinstance(s, six.string_types):
+    elif isinstance(s, bytes):
         try:
             # First try strict utf-8
             enc = 'utf-8'
@@ -81,25 +85,60 @@ def convert_to_unicode(s, encoding_list):
 
 
 def convert_line_endings(data):
-    # Files without a trailing newline come out of Perforce (and possibly
-    # other systems) with a trailing \r. Diff will see the \r and
-    # add a "\ No newline at end of file" marker at the end of the file's
-    # contents, which patch understands and will happily apply this to
-    # a file with a trailing \r.
-    #
-    # The problem is that we normalize \r's to \n's, which breaks patch.
-    # Our solution to this is to just remove that last \r and not turn
-    # it into a \n.
-    #
-    # See http://code.google.com/p/reviewboard/issues/detail?id=386
-    # and http://reviews.reviewboard.org/r/286/
-    if data == b"":
-        return b""
+    r"""Convert line endings in a file.
 
-    if data[-1] == b"\r":
-        data = data[:-1]
+    Some types of repositories provide files with a single trailing Carriage
+    Return (``\r``), even if the rest of the file used a CRLF (``\r\n``)
+    throughout. In these cases, GNU diff will add a ``\ No newline at end of
+    file`` to the end of the diff, which GNU patch understands and will apply
+    to files with just a trailing ``\r``.
 
-    return NEWLINE_CONVERSION_RE.sub(b'\n', data)
+    However, we normalize ``\r`` to ``\n``, which breaks GNU patch in these
+    cases. This function works around this by removing the last ``\r`` and
+    then converting standard types of newlines to a ``\n``.
+
+    This is not meant for use in providing byte-compatible versions of files,
+    but rather to help with comparing lines-for-lines in situations where
+    two versions of a file may come from different platforms with different
+    newlines.
+
+    Args:
+        data (bytes or unicode):
+            A string to normalize. This supports either byte strings or
+            Unicode strings.
+
+    Returns:
+        bytes or unicode:
+        The data with newlines converted, in the original string type.
+
+    Raises:
+        TypeError:
+            The ``data`` argument provided is not a byte string or Unicode
+            string.
+    """
+    # See https://www.reviewboard.org/bugs/386/ and
+    # https://reviews.reviewboard.org/r/286/ for the rationale behind the
+    # normalization.
+    if data:
+        if isinstance(data, bytes):
+            cr = b'\r'
+            lf = b'\n'
+            newline_re = NEWLINE_CONVERSION_BYTES_RE
+        elif isinstance(data, six.text_type):
+            cr = '\r'
+            lf = '\n'
+            newline_re = NEWLINE_CONVERSION_UNICODE_RE
+        else:
+            raise TypeError(
+                _('%s is not a valid string type for convert_line_endings.')
+                % type(data))
+
+        if data.endswith(cr):
+            data = data[:-1]
+
+        data = newline_re.sub(lf, data)
+
+    return data
 
 
 def split_line_endings(data):
@@ -181,7 +220,7 @@ def patch(diff, orig_file, filename, request=None):
             failure = p.returncode
 
         try:
-            with open(newfile, 'r') as f:
+            with open(newfile, 'rb') as f:
                 new_file = f.read()
         except Exception:
             new_file = None
@@ -195,11 +234,12 @@ def patch(diff, orig_file, filename, request=None):
             except Exception:
                 rejects = None
 
-            error_output = stderr.strip() or stdout.strip()
+            error_output = force_text(stderr.strip() or stdout.strip())
 
             # Munge the output to show the filename instead of
             # randomly-generated tempdir locations.
             base_filename = os.path.basename(filename)
+
             error_output = (
                 error_output
                 .replace(rejects_file, '%s.rej' % base_filename)
@@ -215,18 +255,36 @@ def patch(diff, orig_file, filename, request=None):
         log_timer.done()
 
 
-def get_original_file(filediff, request, encoding_list):
-    """
-    Get a file either from the cache or the SCM, applying the parent diff if
-    it exists.
+def get_original_file_from_repo(filediff, request, encoding_list):
+    """Return the pre-patch file for the FileDiff from the repository.
 
-    SCM exceptions are passed back to the caller.
+    The parent diff will be applied if it exists.
+
+    Args:
+        filediff (reviewboard.diffviewer.models.filediff.FileDiff):
+            The FileDiff to retrieve the pre-patch file for.
+
+        request (django.http.HttpRequest):
+            The HTTP request from the client.
+
+        encoding_list (list of unicode):
+            The list of encodings to use.
+
+    Returns:
+        bytes:
+        The pre-patch file.
+
+    Raises:
+        reviewboard.diffutils.errors.PatchError:
+            An error occurred when trying to apply the patch.
+
+        reviewboard.scmtools.errors.SCMError:
+            An error occurred while computing the pre-patch file.
     """
-    data = b""
+    data = b''
 
     if not filediff.is_new:
-        repository = filediff.diffset.repository
-        data = repository.get_file(
+        data = filediff.diffset.repository.get_file(
             filediff.source_file,
             filediff.source_revision,
             base_commit_id=filediff.diffset.base_commit_id,
@@ -253,18 +311,113 @@ def get_original_file(filediff, request, encoding_list):
     # If there's a parent diff set, apply it to the buffer.
     if (filediff.parent_diff and
         (not filediff.extra_data or
-         not filediff.extra_data.get('parent_moved', False))):
-        data = patch(filediff.parent_diff, data, filediff.source_file,
-                     request)
+         (not filediff.extra_data.get('parent_moved', False) and
+          not filediff.is_parent_diff_empty(cache_only=True)))):
+        try:
+            data = patch(filediff.parent_diff, data, filediff.source_file,
+                         request)
+        except PatchError as e:
+            # patch(1) cannot process diff files that contain no diff sections.
+            # We are going to check and see if the parent diff contains no diff
+            # chunks.
+            if (e.error_output == _PATCH_GARBAGE_INPUT and
+                not filediff.is_parent_diff_empty()):
+                raise
 
     return data
 
 
-def get_patched_file(buffer, filediff, request):
-    tool = filediff.diffset.repository.get_scmtool()
-    diff = tool.normalize_patch(filediff.diff, filediff.source_file,
-                                filediff.source_revision)
-    return patch(diff, buffer, filediff.dest_file, request)
+def get_original_file(filediff, request, encoding_list):
+    """Return the pre-patch file of a FileDiff.
+
+    Args:
+        filediff (reviewboard.diffviewer.models.filediff.FileDiff):
+            The FileDiff to retrieve the pre-patch file for.
+
+        request (django.http.HttpRequest):
+            The HTTP request from the client.
+
+        encoding_list (list of unicode):
+            The list of encodings to use.
+
+    Returns:
+        bytes:
+        The pre-patch file.
+
+    Raises:
+        reviewboard.diffutils.errors.PatchError:
+            An error occurred when trying to apply the patch.
+
+        reviewboard.scmtools.errors.SCMError:
+            An error occurred while computing the pre-patch file.
+    """
+    data = b''
+
+    # If the FileDiff has a parent diff, it must be the case that it has no
+    # ancestor FileDiffs. We can fall back to the no history case here.
+    if filediff.parent_diff:
+        return get_original_file_from_repo(filediff, request, encoding_list)
+
+    # Otherwise, there may be one or more ancestors that we have to apply.
+    ancestors = filediff.get_ancestors(minimal=True)
+
+    if ancestors:
+        oldest_ancestor = ancestors[0]
+
+        # If the file was created outside this history, fetch it from the
+        # repository and apply the parent diff if it exists.
+        if not oldest_ancestor.is_new:
+            data = get_original_file_from_repo(oldest_ancestor,
+                                               request,
+                                               encoding_list)
+
+        if not oldest_ancestor.is_diff_empty:
+            data = patch(oldest_ancestor.diff, data,
+                         oldest_ancestor.source_file, request)
+
+        for ancestor in ancestors[1:]:
+            # TODO: Cache these results so that if this ``filediff`` is an
+            # ancestor of another FileDiff, computing that FileDiff's original
+            # file will be cheaper. This will also allow an ancestor filediff's
+            # original file to be computed cheaper.
+            data = patch(ancestor.diff, data, ancestor.source_file, request)
+    elif not filediff.is_new:
+        data = get_original_file_from_repo(filediff,
+                                           request,
+                                           encoding_list)
+
+    return data
+
+
+def get_patched_file(source_data, filediff, request=None):
+    """Return the patched version of a file.
+
+    This will normalize the patch, applying any changes needed for the
+    repository, and then patch the provided data with the patch contents.
+
+    Args:
+        source_data (bytes):
+            The file contents to patch.
+
+        filediff (reviewboard.diffviewer.models.filediff.FileDiff):
+            The FileDiff representing the patch.
+
+        request (django.http.HttpClient, optional):
+            The HTTP request from the client.
+
+    Returns:
+        bytes:
+        The patched file contents.
+    """
+    diff = filediff.diffset.repository.normalize_patch(
+        patch=filediff.diff,
+        filename=filediff.source_file,
+        revision=filediff.source_revision)
+
+    return patch(diff=diff,
+                 orig_file=source_data,
+                 filename=filediff.dest_file,
+                 request=request)
 
 
 def get_revision_str(revision):
@@ -320,18 +473,20 @@ def get_matched_interdiff_files(tool, filediffs, interfilediffs):
         tool (reviewboard.scmtools.core.SCMTool)
             The tool used for all these diffs.
 
-        filediffs (list of reviewboard.diffviewer.models.FileDiff):
+        filediffs (list of reviewboard.diffviewer.models.filediff.FileDiff):
             The list of filediffs on the left-hand side of the diff range.
 
-        interfilediffs (list of reviewboard.diffviewer.models.FileDiff):
+        interfilediffs (list of reviewboard.diffviewer.models.filediff.
+                        FileDiff):
             The list of filediffs on the right-hand side of the diff range.
 
     Yields:
         tuple:
         A paired off filediff match. This is a tuple containing two entries,
-        each a :py:class:`~reviewboard.diffviewer.models.FileDiff` or ``None``.
+        each a :py:class:`~reviewboard.diffviewer.models.filediff.FileDiff` or
+        ``None``.
     """
-    parser = tool.get_parser('')
+    parser = tool.get_parser(b'')
     _normfile = parser.normalize_diff_filename
 
     def _make_detail_key(filediff):
@@ -522,7 +677,8 @@ def get_matched_interdiff_files(tool, filediffs, interfilediffs):
 
 
 def get_diff_files(diffset, filediff=None, interdiffset=None,
-                   interfilediff=None, request=None, filename_patterns=None):
+                   interfilediff=None, base_filediff=None, request=None,
+                   filename_patterns=None, base_commit=None, tip_commit=None):
     """Return a list of files that will be displayed in a diff.
 
     This will go through the given diffset/interdiffset, or a given filediff
@@ -535,31 +691,79 @@ def get_diff_files(diffset, filediff=None, interdiffset=None,
     list containing all diff chunks used for rendering a side-by-side diff.
 
     Args:
-        diffset (reviewboard.diffviewer.models.DiffSet):
+        diffset (reviewboard.diffviewer.models.diffset.DiffSet):
             The diffset containing the files to return.
 
-        filediff (reviewboard.diffviewer.models.FileDiff, optional):
+        filediff (reviewboard.diffviewer.models.filediff.FileDiff, optional):
             A specific file in the diff to return information for.
 
-        interdiffset (reviewboard.diffviewer.models.DiffSet, optional):
+        interdiffset (reviewboard.diffviewer.models.diffset.DiffSet, optional):
             A second diffset used for an interdiff range.
 
-        interfilediff (reviewboard.diffviewer.models.FileDiff, optional):
+        interfilediff (reviewboard.diffviewer.models.filediff.FileDiff,
+                       optional):
             A second specific file in ``interdiffset`` used to return
             information for. This should be provided if ``filediff`` and
             ``interdiffset`` are both provided. If it's ``None`` in this
             case, then the diff will be shown as reverted for this file.
+
+            This may not be provided if ``base_filediff`` is provided.
+
+        base_filediff (reviewbaord.diffviewer.models.filediff.FileDiff,
+                       optional):
+            The base FileDiff to use.
+
+            This may only be provided if ``filediff`` is provided and
+            ``interfilediff`` is not.
 
         filename_patterns (list of unicode, optional):
             A list of filenames or :py:mod:`patterns <fnmatch>` used to
             limit the results. Each of these will be matched against the
             original and modified file of diffs and interdiffs.
 
+        base_commit (reviewboard.diffviewer.models.diffcommit.DiffCommit,
+                     optional):
+            An optional base commit. No :py:class:`FileDiffs
+            <reviewboard.diffviewer.models.filediff.FileDiff>` from commits
+            before that commit will be included in the results.
+
+            This argument only applies to :py:class:`DiffSets
+            <reviewboard.diffviewer.models.diffset.DiffSet>` with
+            :py:class:`DiffCommits <reviewboard.diffviewer.models.diffcommit
+            .DiffCommit>`.
+
+        tip_commit (reviewboard.diffviewer.models.diffcommit.DiffSet,
+                    optional):
+            An optional tip commit. No :py:class:`FileDiffs
+            <reviewboard.diffviewer.models.filediff.FileDiff>` from commits
+            after that commit will be included in the results.
+
+            This argument only applies to :py:class:`DiffSets
+            <reviewboard.diffviewer.models.diffset.DiffSet>` with
+            :py:class:`DiffCommits <reviewboard.diffviewer.models.diffcommit
+            .DiffCommit>`.
+
     Returns:
         list of dict:
         A list of dictionaries containing information on the files to show
         in the diff, in the order in which they would be shown.
     """
+    # It is presently not supported to do an interdiff with commit spans. It
+    # would require base/tip commits for the interdiffset as well.
+    assert not interdiffset or (base_commit is None and tip_commit is None)
+    assert base_filediff is None or interfilediff is None
+
+    if (diffset.commit_count > 0 and
+        base_commit and
+        tip_commit and
+        base_commit.pk > tip_commit.pk):
+        # If the base commit is more recent than the tip commit the interval
+        # **must** be empty.
+        return []
+
+    per_commit_filediffs = None
+    requested_base_filediff = base_filediff
+
     if filediff:
         filediffs = [filediff]
 
@@ -573,8 +777,41 @@ def get_diff_files(diffset, filediff=None, interdiffset=None,
                                   "diffset id %s, filediff %s" %
                                   (diffset.id, filediff.id),
                                   request=request)
+
+            if (diffset.commit_count > 0 and
+                ((base_commit and filediff.commit_id <= base_commit.pk) or
+                 (tip_commit and filediff.commit_id > tip_commit.pk))):
+                # The requested FileDiff is outside the requested commit range.
+                return []
     else:
-        filediffs = list(diffset.files.select_related().all())
+        if (diffset.commit_count > 0 and
+            (base_commit is not None or tip_commit is not None)):
+            # Even if we have base_commit, we need to query for all FileDiffs
+            # so that we can do ancestor computations.
+            filediffs = per_commit_filediffs = diffset.per_commit_files
+
+            if base_commit:
+                base_commit_id = base_commit.pk
+            else:
+                base_commit_id = 0
+
+            if tip_commit:
+                tip_commit_id = tip_commit.pk
+            else:
+                tip_commit_id = None
+
+            filediffs = [
+                f
+                for f in filediffs
+                if (f.commit_id > base_commit_id and
+                    (not tip_commit_id or
+                     f.commit_id <= tip_commit_id))
+            ]
+
+            filediffs = exclude_ancestor_filediffs(filediffs,
+                                                   per_commit_filediffs)
+        else:
+            filediffs = diffset.cumulative_files
 
         if interdiffset:
             log_timer = log_timed("Generating diff file info for "
@@ -593,7 +830,13 @@ def get_diff_files(diffset, filediff=None, interdiffset=None,
 
     if interdiffset:
         if not filediff:
-            interfilediffs = list(interdiffset.files.all())
+            if interdiffset.commit_count > 0:
+                # Currently, only interdiffing between cumulative diffs is
+                # supported.
+                interfilediffs = interdiffset.cumulative_files
+            else:
+                interfilediffs = list(interdiffset.files.all())
+
         elif interfilediff:
             interfilediffs = [interfilediff]
         else:
@@ -689,6 +932,33 @@ def get_diff_files(diffset, filediff=None, interdiffset=None,
                                                 filenames=filenames):
                 continue
 
+        base_filediff = None
+
+        if filediff.commit_id:
+            # If we pre-computed this above (or before) and we have all
+            # FileDiffs, this will cost no additional queries.
+            #
+            # Otherwise this will cost up to
+            # ``1 + len(diffset.per_commit_files.count())`` queries.
+            ancestors = filediff.get_ancestors(minimal=False,
+                                               filediffs=per_commit_filediffs)
+
+            if ancestors:
+                if requested_base_filediff:
+                    assert len(filediffs) == 1
+
+                    if requested_base_filediff in ancestors:
+                        base_filediff = requested_base_filediff
+                    else:
+                        raise ValueError(
+                            'Invalid base_filediff (ID %d) for filediff (ID '
+                            '%d)'
+                            % (requested_base_filediff.pk, filediff.pk))
+                elif base_commit:
+                    base_filediff = filediff.get_base_filediff(
+                        base_commit=base_commit,
+                        ancestors=ancestors)
+
         f = {
             'depot_filename': depot_filename,
             'dest_filename': dest_filename or depot_filename,
@@ -706,9 +976,23 @@ def get_diff_files(diffset, filediff=None, interdiffset=None,
             'is_symlink': filediff.extra_data.get('is_symlink', False),
             'index': len(files),
             'chunks_loaded': False,
-            'is_new_file': (newfile and not interfilediff and
-                            not filediff.parent_diff),
+            'is_new_file': (
+                (newfile or
+                 (base_filediff is not None and
+                  base_filediff.is_new)) and
+                not interfilediff and
+                not filediff.parent_diff
+            ),
+            'base_filediff': base_filediff,
         }
+
+        # When displaying an interdiff, we do not want to display the
+        # revision of the base filediff. Instead, we will display the diff
+        # revision as computed above.
+        if base_filediff and not interdiffset:
+            f['revision'] = get_revision_str(base_filediff.source_revision)
+            f['depot_filename'] = tool.normalize_path_for_display(
+                base_filediff.source_file)
 
         if force_interdiff:
             f['force_interdiff_revision'] = interdiffset.revision
@@ -736,11 +1020,13 @@ def populate_diff_chunks(files, enable_syntax_highlighting=True,
     from reviewboard.diffviewer.chunk_generator import get_diff_chunk_generator
 
     for diff_file in files:
-        generator = get_diff_chunk_generator(request,
-                                             diff_file['filediff'],
-                                             diff_file['interfilediff'],
-                                             diff_file['force_interdiff'],
-                                             enable_syntax_highlighting)
+        generator = get_diff_chunk_generator(
+            request,
+            diff_file['filediff'],
+            diff_file['interfilediff'],
+            diff_file['force_interdiff'],
+            enable_syntax_highlighting,
+            base_filediff=diff_file.get('base_filediff'))
         chunks = list(generator.get_chunks())
 
         diff_file.update({
@@ -1088,21 +1374,29 @@ def get_sorted_filediffs(filediffs, key=None):
     for the given entry in the list. This will only be called once per
     item.
     """
-    def cmp_filediffs(x, y):
+    def cmp_filediffs(filediff1, filediff2):
+        x = make_key(filediff1)
+        y = make_key(filediff2)
+
         # Sort based on basepath in ascending order.
         if x[0] != y[0]:
-            return cmp(x[0], y[0])
-
-        # Sort based on filename in ascending order, then based on
-        # the extension in descending order, to make *.h sort ahead of
-        # *.c/cpp.
-        x_file, x_ext = os.path.splitext(x[1])
-        y_file, y_ext = os.path.splitext(y[1])
-
-        if x_file == y_file:
-            return cmp(y_ext, x_ext)
+            a = x[0]
+            b = y[0]
         else:
-            return cmp(x_file, y_file)
+            # Sort based on filename in ascending order, then based on
+            # the extension in descending order, to make *.h sort ahead of
+            # *.c/cpp.
+            x_file, x_ext = os.path.splitext(x[1])
+            y_file, y_ext = os.path.splitext(y[1])
+
+            if x_file == y_file:
+                a = y_ext
+                b = x_ext
+            else:
+                a = x_file
+                b = y_file
+
+        return cmp(a, b)
 
     def make_key(filediff):
         if key:
@@ -1116,7 +1410,7 @@ def get_sorted_filediffs(filediffs, key=None):
         else:
             return filename[:i], filename[i + 1:]
 
-    return sorted(filediffs, cmp=cmp_filediffs, key=make_key)
+    return sorted(filediffs, key=cmp_to_key(cmp_filediffs))
 
 
 def get_displayed_diff_line_ranges(chunks, first_vlinenum, last_vlinenum):
@@ -1456,3 +1750,80 @@ def get_diff_data_chunks_info(diff):
     _finalize_result()
 
     return results
+
+
+def check_diff_size(diff_file, parent_diff_file=None):
+    """Check the size of the given diffs against the maximum allowed size.
+
+    If either of the provided diffs are too large, an exception will be raised.
+
+    Args:
+        diff_file (django.core.files.uploadedfile.UploadedFile):
+            The diff file.
+
+        parent_diff_file (django.core.files.uploadedfile.UploadedFile,
+                          optional):
+            The parent diff file, if any.
+
+    Raises:
+        reviewboard.diffviewer.errors.DiffTooBigError:
+            The supplied files are too big.
+    """
+    siteconfig = SiteConfiguration.objects.get_current()
+    max_diff_size = siteconfig.get('diffviewer_max_diff_size')
+
+    if max_diff_size > 0:
+        if diff_file.size > max_diff_size:
+            raise DiffTooBigError(
+                _('The supplied diff file is too large.'),
+                max_diff_size=max_diff_size)
+
+        if parent_diff_file and parent_diff_file.size > max_diff_size:
+            raise DiffTooBigError(
+                _('The supplied parent diff file is too large.'),
+                max_diff_size=max_diff_size)
+
+
+def get_total_line_counts(files_qs):
+    """Return the total line counts of all given FileDiffs.
+
+    Args:
+        files_qs (django.db.models.query.QuerySet):
+            The queryset descripting the :py:class:`FileDiffs
+            <reviewboard.diffviewer.models.filediff.FileDiff>`.
+
+    Returns:
+        dict:
+        A dictionary with the following keys:
+
+        * ``raw_insert_count``
+        * ``raw_delete_count``
+        * ``insert_count``
+        * ``delete_count``
+        * ``replace_count``
+        * ``equal_count``
+        * ``total_line_count``
+
+        Each entry maps to the sum of that line count type for all
+        :py:class:`FileDiffs
+        <reviewboard.diffviewer.models.filediff.FileDiff>`.
+    """
+    counts = {
+        'raw_insert_count': 0,
+        'raw_delete_count': 0,
+        'insert_count': 0,
+        'delete_count': 0,
+        'replace_count': None,
+        'equal_count': None,
+        'total_line_count': None,
+    }
+
+    for filediff in files_qs:
+        for key, value in six.iteritems(filediff.get_line_counts()):
+            if value is not None:
+                if counts[key] is None:
+                    counts[key] = value
+                else:
+                    counts[key] += value
+
+    return counts

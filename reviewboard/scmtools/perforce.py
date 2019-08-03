@@ -17,6 +17,7 @@ from contextlib import contextmanager
 
 from django.conf import settings
 from django.utils import six
+from django.utils.encoding import force_str, force_text
 from django.utils.functional import cached_property
 from django.utils.translation import ugettext_lazy as _
 from djblets.util.filesystem import is_exe_in_path
@@ -266,7 +267,7 @@ class PerforceClient(object):
 
         self.p4port = path
         self.username = username
-        self.password = password
+        self.password = password or ''
         self.encoding = encoding
         self.p4host = host
         self.client_name = client_name
@@ -336,7 +337,7 @@ class PerforceClient(object):
         logging.info('Logging into Perforce host "%s" (user "%s")',
                      self.p4port, self.username)
 
-        self.p4.password = self.password.encode('utf-8')
+        self.p4.password = force_str(self.password)
         self.p4.run_login()
 
     @contextmanager
@@ -360,10 +361,10 @@ class PerforceClient(object):
                 with client.connect():
                     ...
         """
-        self.p4.user = self.username.encode('utf-8')
+        self.p4.user = force_str(self.username)
 
         if self.encoding:
-            self.p4.charset = self.encoding.encode('utf-8')
+            self.p4.charset = force_str(self.encoding)
 
         # Exceptions will only be raised for errors, not warnings.
         self.p4.exception_level = 1
@@ -377,13 +378,13 @@ class PerforceClient(object):
             proxy = None
             p4_port = self.p4port
 
-        self.p4.port = p4_port.encode('utf-8')
+        self.p4.port = force_str(p4_port)
 
         if self.p4host:
-            self.p4.host = self.p4host.encode('utf-8')
+            self.p4.host = force_str(self.p4host)
 
         if self.client_name:
-            self.p4.client = self.client_name.encode('utf-8')
+            self.p4.client = force_str(self.client_name)
 
         if self.use_ticket_auth:
             # The repository is configured for ticket-based authentication.
@@ -400,7 +401,7 @@ class PerforceClient(object):
 
             if not os.path.exists(tickets_dir):
                 try:
-                    os.makedirs(tickets_dir, 0700)
+                    os.makedirs(tickets_dir, 0o700)
                 except Exception as e:
                     logging.warning('Unable to create Perforce tickets '
                                     'directory %s: %s',
@@ -408,12 +409,12 @@ class PerforceClient(object):
                     tickets_dir = None
 
             if tickets_dir:
-                self.p4.ticket_file = \
-                    os.path.join(tickets_dir, 'p4tickets').encode('utf-8')
+                self.p4.ticket_file = force_str(
+                    os.path.join(tickets_dir, 'p4tickets'))
         else:
             # The repository does not use ticket-based authentication. We'll
             # need to set the password that's provided.
-            self.p4.password = self.password.encode('utf-8')
+            self.p4.password = force_str(self.password)
 
         try:
             with self.p4.connect():
@@ -653,12 +654,12 @@ class PerforceTool(SCMTool):
             local_site_name = None
 
         self.client = PerforceClient(
-            path=six.text_type(repository.mirror_path or repository.path),
-            username=six.text_type(credentials['username']),
-            password=six.text_type(credentials['password'] or ''),
-            encoding=six.text_type(repository.encoding),
-            host=six.text_type(repository.extra_data.get('p4_host')),
-            client_name=six.text_type(repository.extra_data.get('p4_client')),
+            path=repository.mirror_path or repository.path,
+            username=credentials['username'],
+            password=credentials['password'],
+            encoding=repository.encoding,
+            host=repository.extra_data.get('p4_host'),
+            client_name=repository.extra_data.get('p4_client'),
             local_site_name=local_site_name,
             use_ticket_auth=repository.extra_data.get('use_ticket_auth',
                                                       False))
@@ -715,11 +716,11 @@ class PerforceTool(SCMTool):
         # 'p4 info' will succeed even if the server requires ticket auth and we
         # don't run 'p4 login' first. We therefore don't go through all the
         # trouble of handling tickets here.
-        client = PerforceClient(path=six.text_type(path),
-                                username=six.text_type(username),
-                                password=six.text_type(password),
-                                host=six.text_type(p4_host or ''),
-                                client_name=six.text_type(p4_client or ''),
+        client = PerforceClient(path=path,
+                                username=username,
+                                password=password,
+                                host=p4_host,
+                                client_name=p4_client,
                                 local_site_name=local_site_name)
         client.get_info()
 
@@ -804,8 +805,8 @@ class PerforceTool(SCMTool):
 
         return stat is not None and 'headRev' in stat
 
-    def parse_diff_revision(self, file_str, revision_str, *args, **kwargs):
-        """Return a parsed filename and revision as represented in a diff.
+    def parse_diff_revision(self, filename, revision, *args, **kwargs):
+        """Parse and return a filename and revision from a diff.
 
         This will separate out the filename from the revision (separated by
         a ``#``) and return the results.
@@ -816,10 +817,10 @@ class PerforceTool(SCMTool):
         files.
 
         Args:
-            file_str (unicode):
+            filename (bytes):
                 The filename as represented in the diff.
 
-            revision_str (unicode):
+            revision (bytes):
                 The revision as represented in the diff.
 
             **args (tuple):
@@ -830,14 +831,22 @@ class PerforceTool(SCMTool):
 
         Returns:
             tuple:
-            A tuple containing two items: The normalized filename string, and
-            a :py:class:`~reviewboard.scmtools.core.Revision`.
+            A tuple containing two items:
+
+            1. The normalized filename as a byte string.
+            2. The normalized revision as a byte string or a
+               :py:class:`~reviewboard.scmtools.core.Revision`.
 
         Raises:
             reviewboard.scmtools.errors.InvalidRevisionFormatError:
-                The ``revision`` was in an invalid format.
+                The revision was in an invalid format.
         """
-        filename, revision = revision_str.rsplit('#', 1)
+        assert isinstance(filename, bytes), (
+            'filename must be a byte string, not %s' % type(filename))
+        assert isinstance(revision, bytes), (
+            'revision must be a byte string, not %s' % type(revision))
+
+        filename, revision = revision.rsplit(b'#', 1)
 
         try:
             int(revision)
@@ -850,9 +859,10 @@ class PerforceTool(SCMTool):
         # in the repository.
         #
         # Newer versions use #0, so it's quicker to check.
-        if (revision == '0' or
-            (revision == '1' and
-             not self.repository.get_file_exists(filename, revision))):
+        if (revision == b'0' or
+            (revision == b'1' and
+             not self.repository.get_file_exists(filename.decode('utf-8'),
+                                                 revision.decode('utf-8')))):
             revision = PRE_CREATION
 
         return filename, revision
@@ -1006,19 +1016,19 @@ class PerforceTool(SCMTool):
         # isn't attempting to "claim" another's changelist.  We then split
         # everything around the 'Affected files ...' line, and process the
         # results.
-        changeset.username = changedesc['user']
+        changeset.username = force_text(changedesc['user'])
 
-        try:
-            changeset.description = changedesc['desc'].decode('utf-8')
-        except UnicodeDecodeError:
-            changeset.description = changedesc['desc'].decode('utf-8',
-                                                              'replace')
+        changeset.description = force_text(changedesc['desc'],
+                                           errors='replace')
 
         if changedesc['status'] == 'pending':
             changeset.pending = True
 
         try:
-            changeset.files = changedesc['depotFile']
+            changeset.files = [
+                force_text(depot_file)
+                for depot_file in changedesc['depotFile']
+            ]
         except KeyError:
             if not allow_empty:
                 raise EmptyChangeSetError(changenum)
@@ -1043,7 +1053,7 @@ class PerforceDiffParser(DiffParser):
     """
 
     SPECIAL_REGEX = re.compile(
-        r'^==== ([^#]+)#(\d+) ==([AMD]|MV)== (.*) ====$')
+        br'^==== ([^#]+)#(\d+) ==([AMD]|MV)== (.*) ====$')
 
     def parse_diff_header(self, linenum, info):
         """Parse a header in the diff.
@@ -1069,9 +1079,9 @@ class PerforceDiffParser(DiffParser):
         if m:
             info.update({
                 'origFile': m.group(1),
-                'origInfo': '%s#%s' % (m.group(1), m.group(2)),
+                'origInfo': b'%s#%s' % (m.group(1), m.group(2)),
                 'newFile': m.group(4),
-                'newInfo': '',
+                'newInfo': b'',
             })
             linenum += 1
 
@@ -1087,9 +1097,9 @@ class PerforceDiffParser(DiffParser):
 
             change_type = m.group(3)
 
-            if change_type == 'D':
+            if change_type == b'D':
                 info['deleted'] = True
-            elif change_type == 'MV':
+            elif change_type == b'MV':
                 info['moved'] = True
 
             # In this case, this *is* our diff header. We don't want to

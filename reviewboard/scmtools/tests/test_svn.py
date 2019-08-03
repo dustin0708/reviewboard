@@ -6,6 +6,7 @@ from hashlib import md5
 
 import nose
 from django.conf import settings
+from django.utils import six
 from kgb import SpyAgency
 
 from reviewboard.diffviewer.diffutils import patch
@@ -14,6 +15,8 @@ from reviewboard.scmtools.core import (Branch, Commit, Revision, HEAD,
 from reviewboard.scmtools.errors import SCMError, FileNotFoundError
 from reviewboard.scmtools.models import Repository, Tool
 from reviewboard.scmtools.svn import recompute_svn_backend
+from reviewboard.scmtools.svn.utils import (collapse_svn_keywords,
+                                            has_expanded_svn_keywords)
 from reviewboard.scmtools.tests.testcases import SCMTestCase
 
 
@@ -40,9 +43,10 @@ class _CommonSVNTestCase(SpyAgency, SCMTestCase):
                          '..', 'testdata', 'svn_repo'))
         self.svn_ssh_path = ('svn+ssh://localhost%s'
                              % self.svn_repo_path.replace('\\', '/'))
-        self.repository = Repository(name='Subversion SVN',
-                                     path='file://' + self.svn_repo_path,
-                                     tool=Tool.objects.get(name='Subversion'))
+        self.repository = Repository.objects.create(
+            name='Subversion SVN',
+            path='file://%s' % self.svn_repo_path,
+            tool=Tool.objects.get(name='Subversion'))
 
         try:
             self.tool = self.repository.get_scmtool()
@@ -65,6 +69,22 @@ class _CommonSVNTestCase(SpyAgency, SCMTestCase):
 
         return desc
 
+    def test_get_repository_info(self):
+        """Testing SVN (<backend>) get_repository_info"""
+        info = self.tool.get_repository_info()
+
+        self.assertIn('uuid', info)
+        self.assertIsInstance(info['uuid'], six.text_type)
+        self.assertEqual(info['uuid'], '41215d38-f5a5-421f-ba17-e0be11e6c705')
+
+        self.assertIn('root_url', info)
+        self.assertIsInstance(info['root_url'], six.text_type)
+        self.assertEqual(info['root_url'], self.repository.path)
+
+        self.assertIn('url', info)
+        self.assertIsInstance(info['url'], six.text_type)
+        self.assertEqual(info['url'], self.repository.path)
+
     def test_ssh(self):
         """Testing SVN (<backend>) with a SSH-backed Subversion repository"""
         self._test_ssh(self.svn_ssh_path, 'trunk/doc/misc-docs/Makefile')
@@ -78,6 +98,8 @@ class _CommonSVNTestCase(SpyAgency, SCMTestCase):
 
     def test_get_file(self):
         """Testing SVN (<backend>) get_file"""
+        tool = self.tool
+
         expected = (b'include ../tools/Makefile.base-vars\n'
                     b'NAME = misc-docs\n'
                     b'OUTNAME = svn-misc-docs\n'
@@ -87,64 +109,91 @@ class _CommonSVNTestCase(SpyAgency, SCMTestCase):
         # There are 3 versions of this test in order to get 100% coverage of
         # the svn module.
         rev = Revision('2')
-        file = 'trunk/doc/misc-docs/Makefile'
+        filename = 'trunk/doc/misc-docs/Makefile'
 
-        value = self.tool.get_file(file, rev)
-        self.assertTrue(isinstance(value, bytes))
+        value = tool.get_file(filename, rev)
+        self.assertIsInstance(value, bytes)
         self.assertEqual(value, expected)
 
-        self.assertEqual(self.tool.get_file('/' + file, rev), expected)
+        value = tool.get_file('/%s' % filename, rev)
+        self.assertIsInstance(value, bytes)
+        self.assertEqual(value, expected)
 
-        self.assertEqual(
-            self.tool.get_file(self.repository.path + '/' + file, rev),
-            expected)
+        value = tool.get_file('%s/%s' % (self.repository.path, filename), rev)
+        self.assertIsInstance(value, bytes)
+        self.assertEqual(value, expected)
 
-        self.assertTrue(self.tool.file_exists('trunk/doc/misc-docs/Makefile'))
-        self.assertTrue(
-            not self.tool.file_exists('trunk/doc/misc-docs/Makefile2'))
+        with self.assertRaises(FileNotFoundError):
+            tool.get_file('')
 
-        self.assertRaises(FileNotFoundError, lambda: self.tool.get_file(''))
+    def test_file_exists(self):
+        """Testing SVN (<backend>) file_exists"""
+        tool = self.tool
 
-        self.assertRaises(FileNotFoundError,
-                          lambda: self.tool.get_file('hello', PRE_CREATION))
+        self.assertTrue(tool.file_exists('trunk/doc/misc-docs/Makefile'))
+        self.assertFalse(tool.file_exists('trunk/doc/misc-docs/Makefile2'))
+
+        with self.assertRaises(FileNotFoundError):
+            tool.get_file('hello', PRE_CREATION)
 
     def test_revision_parsing(self):
         """Testing SVN (<backend>) revision number parsing"""
         self.assertEqual(
-            self.tool.parse_diff_revision('', '(working copy)')[1],
-            HEAD)
+            self.tool.parse_diff_revision(filename=b'',
+                                          revision=b'(working copy)'),
+            (b'', HEAD))
         self.assertEqual(
-            self.tool.parse_diff_revision('', '   (revision 0)')[1],
-            PRE_CREATION)
+            self.tool.parse_diff_revision(filename=b'',
+                                          revision=b'   (revision 0)'),
+            (b'', PRE_CREATION))
 
-        self.assertEqual(self.tool.parse_diff_revision('', '(revision 1)')[1],
-                         '1')
-        self.assertEqual(self.tool.parse_diff_revision('', '(revision 23)')[1],
-                         '23')
+        self.assertEqual(
+            self.tool.parse_diff_revision(filename=b'',
+                                          revision=b'(revision 1)'),
+            (b'', b'1'))
+        self.assertEqual(
+            self.tool.parse_diff_revision(filename=b'',
+                                          revision=b'(revision 23)'),
+            (b'', b'23'))
 
         # Fix for bug 2176
         self.assertEqual(
-            self.tool.parse_diff_revision('', '\t(revision 4)')[1], '4')
+            self.tool.parse_diff_revision(filename=b'',
+                                          revision=b'\t(revision 4)'),
+            (b'', b'4'))
 
         self.assertEqual(
             self.tool.parse_diff_revision(
-                '', '2007-06-06 15:32:23 UTC (rev 10958)')[1],
-            '10958')
+                filename=b'',
+                revision=b'2007-06-06 15:32:23 UTC (rev 10958)'),
+            (b'', b'10958'))
 
         # Fix for bug 2632
-        self.assertEqual(self.tool.parse_diff_revision('', '(revision )')[1],
-                         PRE_CREATION)
+        self.assertEqual(
+            self.tool.parse_diff_revision(filename=b'',
+                                          revision=b'(revision )'),
+            (b'', PRE_CREATION))
 
-        self.assertRaises(SCMError,
-                          lambda: self.tool.parse_diff_revision('', 'hello'))
+        with self.assertRaises(SCMError):
+            self.tool.parse_diff_revision(filename=b'',
+                                          revision=b'hello')
 
         # Verify that 'svn diff' localized revision strings parse correctly.
-        self.assertEqual(self.tool.parse_diff_revision('', '(revisión: 5)')[1],
-                         '5')
-        self.assertEqual(self.tool.parse_diff_revision('',
-                         '(リビジョン 6)')[1], '6')
-        self.assertEqual(self.tool.parse_diff_revision('', '(版本 7)')[1],
-                         '7')
+        self.assertEqual(
+            self.tool.parse_diff_revision(
+                filename=b'',
+                revision='(revisión: 5)'.encode('utf-8')),
+            (b'', b'5'))
+        self.assertEqual(
+            self.tool.parse_diff_revision(
+                filename=b'',
+                revision='(リビジョン 6)'.encode('utf-8')),
+            (b'', b'6'))
+        self.assertEqual(
+            self.tool.parse_diff_revision(
+                filename=b'',
+                revision='(版本 7)'.encode('utf-8')),
+            (b'', b'7'))
 
     def test_revision_parsing_with_nonexistent(self):
         """Testing SVN (<backend>) revision parsing with "(nonexistent)"
@@ -152,18 +201,22 @@ class _CommonSVNTestCase(SpyAgency, SCMTestCase):
         """
         # English
         self.assertEqual(
-            self.tool.parse_diff_revision('', '(nonexistent)')[1],
-            PRE_CREATION)
+            self.tool.parse_diff_revision(filename=b'',
+                                          revision=b'(nonexistent)'),
+            (b'', PRE_CREATION))
 
         # German
         self.assertEqual(
-            self.tool.parse_diff_revision('', '(nicht existent)')[1],
-            PRE_CREATION)
+            self.tool.parse_diff_revision(filename=b'',
+                                          revision=b'(nicht existent)'),
+            (b'', PRE_CREATION))
 
         # Simplified Chinese
         self.assertEqual(
-            self.tool.parse_diff_revision('', '(不存在的)')[1],
-            PRE_CREATION)
+            self.tool.parse_diff_revision(
+                filename=b'',
+                revision='(不存在的)'.encode('utf-8')),
+            (b'', PRE_CREATION))
 
     def test_revision_parsing_with_nonexistent_and_branches(self):
         """Testing SVN (<backend>) revision parsing with relocation
@@ -171,18 +224,21 @@ class _CommonSVNTestCase(SpyAgency, SCMTestCase):
         """
         self.assertEqual(
             self.tool.parse_diff_revision(
-                '', '(.../trunk) (nonexistent)')[1],
-            PRE_CREATION)
+                filename=b'',
+                revision=b'(.../trunk) (nonexistent)'),
+            (b'trunk/', PRE_CREATION))
 
         self.assertEqual(
             self.tool.parse_diff_revision(
-                '', '(.../branches/branch-1.0)     (nicht existent)')[1],
-            PRE_CREATION)
+                filename=b'',
+                revision=b'(.../branches/branch-1.0)     (nicht existent)'),
+            (b'branches/branch-1.0/', PRE_CREATION))
 
         self.assertEqual(
             self.tool.parse_diff_revision(
-                '', '        (.../trunk)     (不存在的)')[1],
-            PRE_CREATION)
+                filename=b'',
+                revision='        (.../trunk)     (不存在的)'.encode('utf-8')),
+            (b'trunk/', PRE_CREATION))
 
     def test_interface(self):
         """Testing SVN (<backend>) with basic SVNTool API"""
@@ -200,8 +256,32 @@ class _CommonSVNTestCase(SpyAgency, SCMTestCase):
                 b'svn:mime-type = application/octet-stream\n')
 
         file = self.tool.get_parser(diff).parse()[0]
-        self.assertEqual(file.origFile, 'binfile')
+        self.assertEqual(file.orig_filename, b'binfile')
         self.assertEqual(file.binary, True)
+
+    def test_binary_diff_with_property_change(self):
+        """Testing SVN (<backend>) parsing SVN diff with binary file with
+        property change
+        """
+        diff = (
+            b'Index: binfile\n'
+            b'============================================================'
+            b'=======\n'
+            b'Cannot display: file marked as a binary type.\n'
+            b'svn:mime-type = application/octet-stream\n'
+            b'\n'
+            b'Property changes on: binfile\n'
+            b'____________________________________________________________'
+            b'_______\n'
+            b'Added: svn:mime-type\n'
+            b'## -0,0 +1 ##\n'
+            b'+application/octet-stream\n'
+            b'\\ No newline at end of property\n'
+        )
+
+        file = self.tool.get_parser(diff).parse()[0]
+        self.assertEqual(file.orig_filename, b'binfile')
+        self.assertTrue(file.binary)
 
     def test_keyword_diff(self):
         """Testing SVN (<backend>) parsing diff with keywords"""
@@ -274,7 +354,7 @@ class _CommonSVNTestCase(SpyAgency, SCMTestCase):
 
         files = self.tool.get_parser(diff).parse()
         self.assertEqual(len(files), 1)
-        self.assertEqual(files[0].origFile, 'binfile')
+        self.assertEqual(files[0].orig_filename, b'binfile')
         self.assertTrue(files[0].binary)
         self.assertEqual(files[0].insert_count, 0)
         self.assertEqual(files[0].delete_count, 0)
@@ -309,7 +389,7 @@ class _CommonSVNTestCase(SpyAgency, SCMTestCase):
         files = self.tool.get_parser(diff).parse()
 
         self.assertEqual(len(files), 1)
-        self.assertEqual(files[0].origFile, 'binfile')
+        self.assertEqual(files[0].orig_filename, b'binfile')
         self.assertTrue(files[0].binary)
         self.assertEqual(files[0].insert_count, 0)
         self.assertEqual(files[0].delete_count, 0)
@@ -329,7 +409,7 @@ class _CommonSVNTestCase(SpyAgency, SCMTestCase):
 
         files = self.tool.get_parser(diff).parse()
         self.assertEqual(len(files), 1)
-        self.assertEqual(files[0].origFile, 'Filé')
+        self.assertEqual(files[0].orig_filename, 'Filé'.encode('utf-8'))
         self.assertFalse(files[0].binary)
         self.assertEqual(files[0].insert_count, 1)
         self.assertEqual(files[0].delete_count, 0)
@@ -349,7 +429,7 @@ class _CommonSVNTestCase(SpyAgency, SCMTestCase):
 
         files = self.tool.get_parser(diff).parse()
         self.assertEqual(len(files), 1)
-        self.assertEqual(files[0].origFile, 'File with spaces')
+        self.assertEqual(files[0].orig_filename, b'File with spaces')
         self.assertFalse(files[0].binary)
         self.assertEqual(files[0].insert_count, 1)
         self.assertEqual(files[0].delete_count, 0)
@@ -364,10 +444,10 @@ class _CommonSVNTestCase(SpyAgency, SCMTestCase):
 
         files = self.tool.get_parser(diff).parse()
         self.assertEqual(len(files), 1)
-        self.assertEqual(files[0].origFile, 'empty-file')
-        self.assertEqual(files[0].newFile, 'empty-file')
-        self.assertEqual(files[0].origInfo, '(revision 0)')
-        self.assertEqual(files[0].newInfo, '(revision 0)')
+        self.assertEqual(files[0].orig_filename, b'empty-file')
+        self.assertEqual(files[0].modified_filename, b'empty-file')
+        self.assertEqual(files[0].orig_file_details, b'(revision 0)')
+        self.assertEqual(files[0].modified_file_details, b'(revision 0)')
         self.assertFalse(files[0].binary)
         self.assertFalse(files[0].deleted)
         self.assertEqual(files[0].insert_count, 0)
@@ -383,10 +463,10 @@ class _CommonSVNTestCase(SpyAgency, SCMTestCase):
 
         files = self.tool.get_parser(diff).parse()
         self.assertEqual(len(files), 1)
-        self.assertEqual(files[0].origFile, 'empty-file')
-        self.assertEqual(files[0].newFile, 'empty-file')
-        self.assertEqual(files[0].origInfo, '(revision 4)')
-        self.assertEqual(files[0].newInfo, '(working copy)')
+        self.assertEqual(files[0].orig_filename, b'empty-file')
+        self.assertEqual(files[0].modified_filename, b'empty-file')
+        self.assertEqual(files[0].orig_file_details, b'(revision 4)')
+        self.assertEqual(files[0].modified_file_details, b'(working copy)')
         self.assertFalse(files[0].binary)
         self.assertTrue(files[0].deleted)
         self.assertEqual(files[0].insert_count, 0)
@@ -437,10 +517,10 @@ class _CommonSVNTestCase(SpyAgency, SCMTestCase):
         self.assertEqual(len(diff_files), 2)
 
         diff_file = diff_files[1]
-        self.assertEqual(diff_file.origFile, 'path/to/README2')
-        self.assertEqual(diff_file.newFile, 'path/to/README2')
-        self.assertEqual(diff_file.origInfo, '(revision 4)')
-        self.assertEqual(diff_file.newInfo, '(revision )')
+        self.assertEqual(diff_file.orig_filename, b'path/to/README2')
+        self.assertEqual(diff_file.modified_filename, b'path/to/README2')
+        self.assertEqual(diff_file.orig_file_details, b'(revision 4)')
+        self.assertEqual(diff_file.modified_file_details, b'(revision )')
         self.assertFalse(diff_file.binary)
         self.assertFalse(diff_file.deleted)
         self.assertEqual(diff_file.insert_count, 1)
@@ -560,6 +640,84 @@ class _CommonSVNTestCase(SpyAgency, SCMTestCase):
         """Testing SVN (<backend>) with UTF-8 files with keywords"""
         self.repository.get_file('trunk/utf8-file.txt', '9')
 
+    def test_normalize_patch_with_svn_and_expanded_keywords(self):
+        """Testing SVN (<backend>) normalize_patch with expanded keywords"""
+        diff = (
+            b'Index: Makefile\n'
+            b'==========================================================='
+            b'========\n'
+            b'--- Makefile    (revision 4)\n'
+            b'+++ Makefile    (working copy)\n'
+            b'@@ -1,6 +1,7 @@\n'
+            b' # $Id$\n'
+            b' # $Rev: 123$\n'
+            b' # $Revision:: 123   $\n'
+            b'+# foo\n'
+            b' include ../tools/Makefile.base-vars\n'
+            b' NAME = misc-docs\n'
+            b' OUTNAME = svn-misc-docs\n'
+        )
+
+        normalized = self.tool.normalize_patch(
+            patch=diff,
+            filename='trunk/doc/misc-docs/Makefile',
+            revision='4')
+
+        self.assertEqual(
+            normalized,
+            b'Index: Makefile\n'
+            b'==========================================================='
+            b'========\n'
+            b'--- Makefile    (revision 4)\n'
+            b'+++ Makefile    (working copy)\n'
+            b'@@ -1,6 +1,7 @@\n'
+            b' # $Id$\n'
+            b' # $Rev$\n'
+            b' # $Revision::       $\n'
+            b'+# foo\n'
+            b' include ../tools/Makefile.base-vars\n'
+            b' NAME = misc-docs\n'
+            b' OUTNAME = svn-misc-docs\n')
+
+    def test_normalize_patch_with_svn_and_no_expanded_keywords(self):
+        """Testing SVN (<backend>) normalize_patch with no expanded keywords"""
+        diff = (
+            b'Index: Makefile\n'
+            b'==========================================================='
+            b'========\n'
+            b'--- Makefile    (revision 4)\n'
+            b'+++ Makefile    (working copy)\n'
+            b'@@ -1,6 +1,7 @@\n'
+            b' # $Id$\n'
+            b' # $Rev$\n'
+            b' # $Revision::    $\n'
+            b'+# foo\n'
+            b' include ../tools/Makefile.base-vars\n'
+            b' NAME = misc-docs\n'
+            b' OUTNAME = svn-misc-docs\n'
+        )
+
+        normalized = self.tool.normalize_patch(
+            patch=diff,
+            filename='trunk/doc/misc-docs/Makefile',
+            revision='4')
+
+        self.assertEqual(
+            normalized,
+            b'Index: Makefile\n'
+            b'==========================================================='
+            b'========\n'
+            b'--- Makefile    (revision 4)\n'
+            b'+++ Makefile    (working copy)\n'
+            b'@@ -1,6 +1,7 @@\n'
+            b' # $Id$\n'
+            b' # $Rev$\n'
+            b' # $Revision::    $\n'
+            b'+# foo\n'
+            b' include ../tools/Makefile.base-vars\n'
+            b' NAME = misc-docs\n'
+            b' OUTNAME = svn-misc-docs\n')
+
 
 class PySVNTests(_CommonSVNTestCase):
     backend = 'reviewboard.scmtools.svn.pysvn'
@@ -570,23 +728,37 @@ class SubvertpyTests(_CommonSVNTestCase):
     backend = 'reviewboard.scmtools.svn.subvertpy'
     backend_name = 'subvertpy'
 
-    def test_collapse_keywords(self):
-        """Testing SVN keyword collapsing"""
+
+class UtilsTests(SCMTestCase):
+    """Unit tests for reviewboard.scmtools.svn.utils."""
+
+    def test_collapse_svn_keywords(self):
+        """Testing collapse_svn_keywords"""
         keyword_test_data = [
-            ('Id',
-             '/* $Id: test2.c 3 2014-08-04 22:55:09Z david $ */',
-             '/* $Id$ */'),
-            ('id',
-             '/* $Id: test2.c 3 2014-08-04 22:55:09Z david $ */',
-             '/* $Id$ */'),
-            ('id',
-             '/* $id: test2.c 3 2014-08-04 22:55:09Z david $ */',
-             '/* $id$ */'),
-            ('Id',
-             '/* $id: test2.c 3 2014-08-04 22:55:09Z david $ */',
-             '/* $id$ */')
+            (b'Id',
+             b'/* $Id: test2.c 3 2014-08-04 22:55:09Z david $ */',
+             b'/* $Id$ */'),
+            (b'id',
+             b'/* $Id: test2.c 3 2014-08-04 22:55:09Z david $ */',
+             b'/* $Id$ */'),
+            (b'id',
+             b'/* $id: test2.c 3 2014-08-04 22:55:09Z david $ */',
+             b'/* $id$ */'),
+            (b'Id',
+             b'/* $id: test2.c 3 2014-08-04 22:55:09Z david $ */',
+             b'/* $id$ */')
         ]
 
         for keyword, data, result in keyword_test_data:
-            self.assertEqual(self.tool.client.collapse_keywords(data, keyword),
+            self.assertEqual(collapse_svn_keywords(data, keyword),
                              result)
+
+    def test_has_expanded_svn_keywords(self):
+        """Testing has_expanded_svn_keywords"""
+        self.assertTrue(has_expanded_svn_keywords(b'.. $ID: 123$ ..'))
+        self.assertTrue(has_expanded_svn_keywords(b'.. $id::  123$ ..'))
+
+        self.assertFalse(has_expanded_svn_keywords(b'.. $Id::   $ ..'))
+        self.assertFalse(has_expanded_svn_keywords(b'.. $Id$ ..'))
+        self.assertFalse(has_expanded_svn_keywords(b'.. $Id ..'))
+        self.assertFalse(has_expanded_svn_keywords(b'.. $Id Here$ ..'))

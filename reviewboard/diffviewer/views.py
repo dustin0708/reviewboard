@@ -8,28 +8,31 @@ from zipfile import ZipFile
 
 from django.conf import settings
 from django.core.paginator import InvalidPage, Paginator
+from django.core.urlresolvers import NoReverseMatch
 from django.http import (HttpResponse,
+                         HttpResponseBadRequest,
                          HttpResponseNotFound,
                          HttpResponseNotModified,
                          HttpResponseServerError,
                          Http404)
 from django.shortcuts import get_object_or_404
-from django.template import RequestContext
-from django.template.loader import render_to_string
 from django.utils.safestring import mark_safe
 from django.utils.six.moves import cStringIO as StringIO
 from django.utils.translation import ugettext as _
 from django.views.generic.base import TemplateView, View
 from djblets.siteconfig.models import SiteConfiguration
+from djblets.util.compat.django.template.loader import render_to_string
 from djblets.util.http import encode_etag, etag_if_none_match, set_etag
 from pygments import highlight
 from pygments.formatters import HtmlFormatter
 from pygments.lexers import get_lexer_by_name
 
+from reviewboard.diffviewer.commit_utils import (diff_histories,
+                                                 get_base_and_tip_commits)
 from reviewboard.diffviewer.diffutils import (get_diff_files,
                                               get_enable_highlighting)
 from reviewboard.diffviewer.errors import PatchError, UserVisibleError
-from reviewboard.diffviewer.models import DiffSet, FileDiff
+from reviewboard.diffviewer.models import DiffCommit, DiffSet, FileDiff
 from reviewboard.diffviewer.renderers import (get_diff_renderer,
                                               get_diff_renderer_class)
 from reviewboard.scmtools.errors import FileNotFoundError
@@ -83,6 +86,19 @@ class DiffViewerView(TemplateView):
     ``?page=<pagenum>``
         Renders diffs found on the given page number, if the diff viewer
         is paginated.
+
+    ``?base-commit-id=<id>``
+        The ID of the base commit to use to generate the diff for diffs created
+        with multiple commits.
+
+        Only changes from after the specified commit will be included in the
+        diff.
+
+    ``?tip-commit-id=<id>``
+        The ID of the tip commit to use to generate the diff for diffs created
+        created with history.
+
+        No changes from beyond this commit will be included in the diff.
     """
 
     template_name = 'diffviewer/view_diff.html'
@@ -167,10 +183,54 @@ class DiffViewerView(TemplateView):
         except KeyError:
             filename_patterns = []
 
+        base_commit_id = None
+        base_commit = None
+
+        tip_commit_id = None
+        tip_commit = None
+
+        commits_by_diffset_id = {}
+
+        if diffset.commit_count > 0:
+            diffset_pks = [diffset.pk]
+
+            if interdiffset:
+                diffset_pks.append(interdiffset.pk)
+
+            commits = DiffCommit.objects.filter(diffset_id__in=diffset_pks)
+
+            for commit in commits:
+                commits_by_diffset_id.setdefault(commit.diffset_id, []).append(
+                    commit)
+
+            # Base and tip commit selection is not supported in interdiffs.
+            if not interdiffset:
+                raw_base_commit_id = self.request.GET.get('base-commit-id')
+                raw_tip_commit_id = self.request.GET.get('tip-commit-id')
+
+                if raw_base_commit_id is not None:
+                    try:
+                        base_commit_id = int(raw_base_commit_id)
+                    except ValueError:
+                        pass
+
+                if raw_tip_commit_id is not None:
+                    try:
+                        tip_commit_id = int(raw_tip_commit_id)
+                    except ValueError:
+                        pass
+
+                base_commit, tip_commit = get_base_and_tip_commits(
+                    base_commit_id,
+                    tip_commit_id,
+                    commits=commits_by_diffset_id[diffset.pk])
+
         files = get_diff_files(diffset=diffset,
                                interdiffset=interdiffset,
                                request=self.request,
-                               filename_patterns=filename_patterns)
+                               filename_patterns=filename_patterns,
+                               base_commit=base_commit,
+                               tip_commit=tip_commit)
 
         # Break the list of files into pages
         siteconfig = SiteConfiguration.objects.get_current()
@@ -199,6 +259,8 @@ class DiffViewerView(TemplateView):
             page = paginator.page(paginator.num_pages)
 
         diff_context = {
+            'commits': None,
+            'commit_history_diff': None,
             'filename_patterns': list(filename_patterns),
             'revision': {
                 'revision': diffset.revision,
@@ -210,7 +272,7 @@ class DiffViewerView(TemplateView):
                 'is_paginated': page.has_other_pages(),
                 'current_page': page.number,
                 'pages': paginator.num_pages,
-                'page_numbers': paginator.page_range,
+                'page_numbers': list(paginator.page_range),
                 'has_next': page.has_next(),
                 'has_previous': page.has_previous(),
             },
@@ -222,6 +284,34 @@ class DiffViewerView(TemplateView):
         if page.has_previous():
             diff_context['pagination']['previous_page'] = \
                 page.previous_page_number()
+
+        if diffset.commit_count > 0:
+            if interdiffset:
+                diff_context['commit_history_diff'] = [
+                    entry.serialize()
+                    for entry in diff_histories(
+                        commits_by_diffset_id[diffset.pk],
+                        commits_by_diffset_id[interdiffset.pk])
+                ]
+
+            all_commits = [
+                commit
+                for pk in commits_by_diffset_id
+                for commit in commits_by_diffset_id[pk]
+            ]
+
+            diff_context['commits'] = [
+                commit.serialize()
+                for commit in sorted(all_commits,
+                                     key=lambda commit: commit.pk)
+            ]
+
+            revision_context = diff_context['revision']
+
+            revision_context.update({
+                'base_commit_id': base_commit_id,
+                'tip_commit_id': tip_commit_id,
+            })
 
         context = dict({
             'diff_context': diff_context,
@@ -269,9 +359,18 @@ class DiffFragmentView(View):
     so must be passed either in the URL or in a subclass's definition of
     that method.
 
-    The caller may also pass ``?lines-of-context=`` as a query parameter to
-    the URL to indicate how many lines of context should be provided around
-    the chunk.
+    The following query parameters can be passed in on the URL:
+
+    ``?lines-of-context=<count>``
+        A number of lines of context to include above and below the chunk.
+
+    ``?base-filediff-id<=id>``
+        The primary key of the base FileDiff.
+
+        This parameter is ignored if the review request was created without
+        commit history support.
+
+        This conflicts with the ``interfilediff_id``.
     """
 
     template_name = 'diffviewer/diff_file_fragment.html'
@@ -305,6 +404,8 @@ class DiffFragmentView(View):
         interfilediff_id = kwargs.get('interfilediff_id')
         chunk_index = kwargs.get('chunk_index')
 
+        base_filediff_id = request.GET.get('base-filediff-id')
+
         try:
             renderer_settings = self._get_renderer_settings(**kwargs)
             etag = self.make_etag(renderer_settings, **kwargs)
@@ -312,7 +413,9 @@ class DiffFragmentView(View):
             if etag_if_none_match(request, etag):
                 return HttpResponseNotModified()
 
-            diff_info_or_response = self.process_diffset_info(**kwargs)
+            diff_info_or_response = self.process_diffset_info(
+                base_filediff_id=base_filediff_id,
+                **kwargs)
 
             if isinstance(diff_info_or_response, HttpResponse):
                 return diff_info_or_response
@@ -353,16 +456,23 @@ class DiffFragmentView(View):
                 e,
                 request=request)
 
-            url_kwargs = {
-                key: kwargs[key]
-                for key in ('chunk_index', 'interfilediff_id',
-                            'review_request_id', 'filediff_id',
-                            'revision', 'interdiff_revision')
-                if key in kwargs and kwargs[key] is not None
-            }
-            bundle_url = local_site_reverse('patch-error-bundle',
-                                            kwargs=url_kwargs,
-                                            request=request)
+            try:
+                url_kwargs = {
+                    key: kwargs[key]
+                    for key in ('chunk_index', 'interfilediff_id',
+                                'review_request_id', 'filediff_id',
+                                'revision', 'interdiff_revision')
+                    if key in kwargs and kwargs[key] is not None
+                }
+
+                bundle_url = local_site_reverse('patch-error-bundle',
+                                                kwargs=url_kwargs,
+                                                request=request)
+            except NoReverseMatch:
+                # We'll sometimes see errors about this failing to resolve when
+                # web crawlers start accessing fragment URLs without the proper
+                # attributes. Ignore them.
+                bundle_url = ''
 
             if e.rejects:
                 lexer = get_lexer_by_name('diff')
@@ -372,25 +482,33 @@ class DiffFragmentView(View):
                 rejects = None
 
             return HttpResponseServerError(render_to_string(
-                self.patch_error_template_name,
-                RequestContext(request, {
+                template_name=self.patch_error_template_name,
+                context={
                     'bundle_url': bundle_url,
                     'file': diff_info_or_response['diff_file'],
                     'filename': os.path.basename(e.filename),
                     'patch_output': e.error_output,
                     'rejects': mark_safe(rejects),
-                })))
+                },
+                request=request))
+        except FileNotFoundError as e:
+            return HttpResponseServerError(render_to_string(
+                template_name=self.error_template_name,
+                context={
+                    'error': e,
+                    'file': diff_info_or_response['diff_file'],
+                },
+                request=request))
         except Exception as e:
-            if not isinstance(e, FileNotFoundError):
-                logging.exception('%s.get: Error when rendering diffset for '
-                                  'filediff ID=%s, interfilediff ID=%s, '
-                                  'chunkindex=%s: %s',
-                                  self.__class__.__name__,
-                                  filediff_id,
-                                  interfilediff_id,
-                                  chunk_index,
-                                  e,
-                                  request=request)
+            logging.exception('%s.get: Error when rendering diffset for '
+                              'filediff ID=%s, interfilediff ID=%s, '
+                              'chunkindex=%s: %s',
+                              self.__class__.__name__,
+                              filediff_id,
+                              interfilediff_id,
+                              chunk_index,
+                              e,
+                              request=request)
 
             return exception_traceback(
                 self.request, e, self.error_template_name,
@@ -418,13 +536,13 @@ class DiffFragmentView(View):
 
             filediff_id (int):
                 The ID of the
-                :py:class:`~reviewboard.diffviewer.models.FileDiff` being
-                rendered.
+                :py:class:`~reviewboard.diffviewer.models.filediff.FileDiff`
+                being rendered.
 
             interfilediff_id (int):
                 The ID of the
-                :py:class:`~reviewboard.diffviewer.models.FileDiff` on the
-                other side of the diff revision, if viewing an interdiff.
+                :py:class:`~reviewboard.diffviewer.models.filediff.FileDiff` on
+                the other side of the diff revision, if viewing an interdiff.
 
             **kwargs (dict):
                 Additional keyword arguments passed to the function.
@@ -450,7 +568,7 @@ class DiffFragmentView(View):
 
     def process_diffset_info(self, diffset_or_id, filediff_id,
                              interfilediff_id=None, interdiffset_or_id=None,
-                             **kwargs):
+                             base_filediff_id=None, **kwargs):
         """Process and return information on the desired diff.
 
         The diff IDs and other data passed to the view can be processed and
@@ -497,18 +615,36 @@ class DiffFragmentView(View):
 
         filediff = get_object_or_404(FileDiff, pk=filediff_id, diffset=diffset)
 
-        if interfilediff_id:
+        base_filediff = None
+        interfilediff = None
+
+        if interfilediff_id and base_filediff_id:
+            raise UserVisibleError(_(
+                'Cannot generate an interdiff when base FileDiff ID is '
+                'specified.'
+            ))
+        elif interfilediff_id:
             interfilediff = get_object_or_404(FileDiff, pk=interfilediff_id,
                                               diffset=interdiffset)
-        else:
-            interfilediff = None
+        elif base_filediff_id:
+            base_filediff = get_object_or_404(FileDiff, pk=base_filediff_id,
+                                              diffset=diffset)
+
+            ancestors = filediff.get_ancestors(minimal=False)
+
+            if base_filediff not in ancestors:
+                raise UserVisibleError(_(
+                    'The requested FileDiff (ID %s) is not a valid base '
+                    'FileDiff for FileDiff %s.'
+                    % (base_filediff_id, filediff_id)
+                ))
 
         # Store this so we don't end up causing an SQL query later when looking
         # this up.
         filediff.diffset = diffset
 
-        diff_file = self._get_requested_diff_file(diffset, filediff,
-                                                  interdiffset, interfilediff)
+        diff_file = self._get_requested_diff_file(
+            diffset, filediff, interdiffset, interfilediff, base_filediff)
 
         if not diff_file:
             raise UserVisibleError(
@@ -593,7 +729,7 @@ class DiffFragmentView(View):
         }
 
     def _get_requested_diff_file(self, diffset, filediff, interdiffset,
-                                 interfilediff):
+                                 interfilediff, base_filediff):
         """Fetches information on the requested diff.
 
         This will look up information on the diff that's to be rendered
@@ -607,18 +743,18 @@ class DiffFragmentView(View):
                                interdiffset=interdiffset,
                                filediff=filediff,
                                interfilediff=interfilediff,
+                               base_filediff=base_filediff,
                                request=self.request)
 
         if files:
-            file = files[0]
+            diff_file = files[0]
 
-            if 'index' in self.request.GET:
-                try:
-                    file['index'] = int(self.request.GET.get('index'))
-                except ValueError:
-                    pass
+            try:
+                diff_file['index'] = int(self.request.GET['index'])
+            except (KeyError, ValueError):
+                pass
 
-            return file
+            return diff_file
 
         return None
 
@@ -734,12 +870,9 @@ def exception_traceback_string(request, e, template_name, extra_context={}):
     if not isinstance(e, UserVisibleError):
         context['trace'] = traceback.format_exc()
 
-    if request:
-        request_context = RequestContext(request, context)
-    else:
-        request_context = context
-
-    return render_to_string(template_name, request_context)
+    return render_to_string(template_name=template_name,
+                            context=context,
+                            request=request)
 
 
 def exception_traceback(request, e, template_name, extra_context={}):

@@ -3,10 +3,10 @@ from __future__ import unicode_literals
 import re
 
 from django import template
-from django.template.loader import render_to_string
 from django.utils.html import escape
 from django.utils.safestring import mark_safe
 from django.utils.translation import ugettext as _
+from djblets.util.compat.django.template.loader import render_to_string
 
 from reviewboard.diffviewer.chunk_generator import DiffChunkGenerator
 
@@ -118,15 +118,17 @@ def _diff_expand_link(context, expandable, text, tooltip,
     expansion link. It assumes nothing about the content and serves only
     to render the data from a template.
     """
-    return render_to_string('diffviewer/expand_link.html', {
-        'tooltip': tooltip,
-        'text': text,
-        'chunk': context['chunk'],
-        'file': context['file'],
-        'expand_pos': expand_pos,
-        'image_class': image_class,
-        'expandable': expandable,
-    })
+    return render_to_string(
+        template_name='diffviewer/expand_link.html',
+        context={
+            'tooltip': tooltip,
+            'text': text,
+            'chunk': context['chunk'],
+            'file': context['file'],
+            'expand_pos': expand_pos,
+            'image_class': image_class,
+            'expandable': expandable,
+        })
 
 
 @register.simple_tag(takes_context=True)
@@ -215,9 +217,13 @@ def diff_lines(index, chunk, standalone, line_fmt, anchor_fmt='',
 
     for i, line in enumerate(lines):
         row_classes = []
+        header_1_classes = []
+        header_2_classes = []
         cell_1_classes = ['l']
         cell_2_classes = ['r']
         row_class_attr = ''
+        header_1_class_attr = ''
+        header_2_class_attr = ''
         cell_1_class_attr = ''
         cell_2_class_attr = ''
         line1 = line[2]
@@ -269,11 +275,13 @@ def diff_lines(index, chunk, standalone, line_fmt, anchor_fmt='',
                 moved_from_linenum, moved_from_first = moved_info['from']
                 is_moved_row = True
 
+                header_2_classes.append('moved-from')
                 cell_2_classes.append('moved-from')
 
                 if moved_from_first:
                     # This is the start of a new move range.
                     is_first_moved_row = True
+                    header_2_classes.append('moved-from-start')
                     cell_2_classes.append('moved-from-start')
                     moved_from = {
                         'class': 'moved-flag',
@@ -287,11 +295,13 @@ def diff_lines(index, chunk, standalone, line_fmt, anchor_fmt='',
                 moved_to_linenum, moved_to_first = moved_info['to']
                 is_moved_row = True
 
+                header_1_classes.append('moved-to')
                 cell_1_classes.append('moved-to')
 
                 if moved_to_first:
                     # This is the start of a new move range.
                     is_first_moved_row = True
+                    header_1_classes.append('moved-to-start')
                     cell_1_classes.append('moved-to-start')
                     moved_to = {
                         'class': 'moved-flag',
@@ -315,6 +325,12 @@ def diff_lines(index, chunk, standalone, line_fmt, anchor_fmt='',
         if cell_2_classes:
             cell_2_class_attr = ' class="%s"' % ' '.join(cell_2_classes)
 
+        if header_1_classes:
+            header_1_class_attr = ' class="%s"' % ' '.join(header_1_classes)
+
+        if header_2_classes:
+            header_2_class_attr = ' class="%s"' % ' '.join(header_2_classes)
+
         anchor_html = ''
         begin_collapse_html = ''
         end_collapse_html = ''
@@ -324,6 +340,8 @@ def diff_lines(index, chunk, standalone, line_fmt, anchor_fmt='',
         context = {
             'chunk_index': chunk_index,
             'row_class_attr': row_class_attr,
+            'header_1_class_attr': header_1_class_attr,
+            'header_2_class_attr': header_2_class_attr,
             'cell_1_class_attr': cell_1_class_attr,
             'cell_2_class_attr': cell_2_class_attr,
             'linenum_row': line[0],
@@ -360,4 +378,4 @@ def diff_lines(index, chunk, standalone, line_fmt, anchor_fmt='',
 
         result.append(line_fmt % context)
 
-    return ''.join(result)
+    return mark_safe(''.join(result))

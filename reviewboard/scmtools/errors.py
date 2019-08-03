@@ -1,5 +1,6 @@
 from __future__ import unicode_literals
 
+from django.utils.encoding import force_text
 from django.utils.translation import ugettext as _
 
 from reviewboard.ssh.errors import SSHAuthenticationError
@@ -32,7 +33,23 @@ class EmptyChangeSetError(ChangeSetError):
 
 class InvalidRevisionFormatError(SCMError):
     """Indicates that a revision isn't in a recognizable format."""
+
     def __init__(self, path, revision, detail=None):
+        """Initialize the exception.
+
+        Args:
+            path (bytes or unicode):
+                The path the revision was for.
+
+            revision (bytes or unicode):
+                The revision that was invalid.
+
+            detail (unicode, optional):
+                Additional detail to display after the standard error message.
+        """
+        path = force_text(path)
+        revision = force_text(revision)
+
         msg = _("The revision '%(revision)s' for '%(path)s' isn't in a valid "
                 "format") % {
             'revision': revision,
@@ -60,16 +77,16 @@ class FileNotFoundError(SCMError):
             msg = (_("The file '%s' could not be found in the repository")
                    % path)
         elif base_commit_id is not None and base_commit_id != revision:
-            msg = _("The file '%(path)s' (r%(revision)s, commit "
-                    "%(base_commit_id)s) could not be found in the "
-                    "repository") % {
+            msg = _('The file "%(path)s" (revision %(revision)s, commit '
+                    '%(base_commit_id)s) could not be found in the '
+                    'repository') % {
                 'path': path,
                 'revision': revision,
                 'base_commit_id': base_commit_id,
             }
         else:
-            msg = _("The file '%(path)s' (r%(revision)s) could not be found "
-                    "in the repository") % {
+            msg = _('The file "%(path)s" (revision %(revision)s) could not be '
+                    'found in the repository') % {
                 'path': path,
                 'revision': revision,
             }

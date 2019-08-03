@@ -107,6 +107,26 @@ def get_diff_item_url(review_request, diff_revision, local_site_name=None):
 
 
 #
+# DiffCommitResource
+#
+def get_diffcommit_list_url(review_request, diff_revision,
+                            local_site_name=None):
+    return resources.diffcommit.get_list_url(
+        local_site_name=local_site_name,
+        review_request_id=review_request.display_id,
+        diff_revision=diff_revision)
+
+
+def get_diffcommit_item_url(review_request, diff_revision, commit_id,
+                            local_site_name=None):
+    return resources.diffcommit.get_item_url(
+        local_site_name=local_site_name,
+        review_request_id=review_request.display_id,
+        diff_revision=diff_revision,
+        commit_id=commit_id)
+
+
+#
 # DiffFileAttachmentResource
 #
 def get_diff_file_attachment_list_url(repository, local_site_name=None):
@@ -121,6 +141,26 @@ def get_diff_file_attachment_item_url(attachment, repository,
         local_site_name=local_site_name,
         repository_id=repository.pk,
         file_attachment_id=attachment.pk)
+
+
+#
+# DraftDiffCommitResource
+#
+def get_draft_diffcommit_list_url(review_request, diff_revision,
+                                  local_site_name=None):
+    return resources.draft_diffcommit.get_list_url(
+        review_request_id=review_request.display_id,
+        diff_revision=diff_revision,
+        local_site_name=local_site_name)
+
+
+def get_draft_diffcommit_item_url(review_request, diff_revision, commit_id,
+                                  local_site_name=None):
+    return resources.draft_diffcommit.get_item_url(
+        review_request_id=review_request.display_id,
+        diff_revision=diff_revision,
+        commit_id=commit_id,
+        local_site_name=local_site_name)
 
 
 #
@@ -668,6 +708,15 @@ def get_review_request_draft_url(review_request, local_site_name=None):
 
 
 #
+# ReviewRequestLastUpdateResource
+#
+def get_review_request_last_update_url(review_request, local_site_name=None):
+    return resources.review_request_last_update.get_item_url(
+        local_site_name=local_site_name,
+        review_request_id=review_request.display_id)
+
+
+#
 # ReviewScreenshotCommentResource
 #
 def get_review_screenshot_comment_list_url(review, local_site_name=None):
@@ -823,6 +872,14 @@ def get_user_file_attachment_item_url(user, file_attachment,
 #
 def get_validate_diff_url(local_site_name=None):
     return resources.validate_diff.get_item_url(
+        local_site_name=local_site_name)
+
+
+#
+# ValidateDiffCommitResource
+#
+def get_validate_diffcommit_url(local_site_name=None):
+    return resources.validate_diffcommit.get_item_url(
         local_site_name=local_site_name)
 
 

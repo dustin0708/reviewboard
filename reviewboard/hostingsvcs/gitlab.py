@@ -7,11 +7,11 @@ import re
 from django import forms
 from django.core.cache import cache
 from django.core.exceptions import ValidationError
-from django.template.loader import render_to_string
 from django.utils.six.moves.urllib.error import HTTPError, URLError
 from django.utils.six.moves.urllib.parse import quote, quote_plus, urlparse
 from django.utils.translation import ugettext_lazy as _, ugettext
 from djblets.cache.backend import cache_memoize
+from djblets.util.compat.django.template.loader import render_to_string
 
 from reviewboard.hostingsvcs.errors import (AuthorizationError,
                                             HostingServiceError,
@@ -110,13 +110,15 @@ class GitLabHostingURLWidget(forms.Widget):
         """
         attrs = self.build_attrs(attrs)
 
-        return render_to_string('hostingsvcs/gitlab/url_widget.html', {
-            'attrs': attrs,
-            'id': attrs.pop('id'),
-            'is_custom': value and value != self.GITLAB,
-            'name': name,
-            'value': value or '',
-        })
+        return render_to_string(
+            template_name='hostingsvcs/gitlab/url_widget.html',
+            context={
+                'attrs': attrs,
+                'id': attrs.pop('id'),
+                'is_custom': value and value != self.GITLAB,
+                'name': name,
+                'value': value or '',
+            })
 
 
 class GitLabAuthForm(HostingServiceAuthForm):
@@ -334,10 +336,9 @@ class GitLab(HostingService):
                 hosting_url,
                 path='/projects?per_page=1',
                 headers={
-                    b'PRIVATE-TOKEN':
-                        credentials['private_token'].encode('utf-8'),
+                    'PRIVATE-TOKEN': credentials['private_token'],
                 })
-        except AuthorizationError:
+        except (AuthorizationError, GitLabAPIVersionError):
             raise
         except HTTPError as e:
             if e.code == 404:
@@ -636,9 +637,11 @@ class GitLab(HostingService):
         diff_url = ('%s%s/commit/%s.diff?private_token=%s'
                     % (hosting_url, path_with_namespace, revision,
                        private_token))
-        diff, headers = self.client.http_get(
+        response = self.client.http_get(
             diff_url,
             headers={'Accept': 'text/plain'})
+
+        diff = response.data
 
         # Remove the last two lines. The last line is 'libgit <version>',
         # and the second last line is '--', ending with '\n'. To avoid the
@@ -1100,19 +1103,19 @@ class GitLab(HostingService):
             url = self._build_api_url(hosting_url, path)
 
         headers = {
-            b'PRIVATE-TOKEN': self._get_private_token(),
+            'PRIVATE-TOKEN': self._get_private_token(),
         }
 
         if not raw_content:
-            headers[b'Accept'] = b'application/json'
+            headers['Accept'] = 'application/json'
 
         try:
-            data, headers = self.client.http_get(url, headers)
+            response = self.client.http_get(url, headers)
 
             if raw_content:
-                return data, headers
+                return response.data, response.headers
             else:
-                return json.loads(data), headers
+                return response.json, response.headers
         except HTTPError as e:
             if e.code == 401:
                 raise AuthorizationError(
@@ -1183,8 +1186,8 @@ class GitLab(HostingService):
         headers = {}
 
         if self.account.data and 'private_token' in self.account.data:
-            headers[b'PRIVATE-TOKEN'] = decrypt_password(
-                self.account.data['private_token'])
+            headers['PRIVATE-TOKEN'] = decrypt_password(
+                self.account.data['private_token']).encode('utf-8')
 
         return cache_memoize(
             'gitlab-api-version:%s' % hosting_url,
@@ -1256,10 +1259,20 @@ class GitLab(HostingService):
             else:
                 return api_version, rsp, headers
 
+        # Note that we're only going to list the error found in the first
+        # HTTP GET attempt. It's more than likely that if we're unable to
+        # look up any version URLs, the root cause will be the same.
         raise GitLabAPIVersionError(
-            'Could not determine GitLab API version for "%s"'
-            % hosting_url,
-            errors,
+            ugettext(
+                'Could not determine the GitLab API version for %(url)s '
+                'due to an unexpected error (%(errors)s). Check to make sure '
+                'the URL can be resolved from this server and that any SSL '
+                'certificates are valid and trusted.'
+            ) % {
+                'url': hosting_url,
+                'errors': errors[0],
+            },
+            causes=errors,
         )
 
     def _parse_commit(self, commit_data):

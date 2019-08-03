@@ -12,6 +12,7 @@ Top-Level Modules
    :toctree: python
 
    reviewboard
+   reviewboard.deprecation
    reviewboard.rb_platform
    reviewboard.signals
 
@@ -23,9 +24,18 @@ User Accounts
    :toctree: python
 
    reviewboard.accounts.backends
+   reviewboard.accounts.backends.ad
+   reviewboard.accounts.backends.base
+   reviewboard.accounts.backends.http_digest
+   reviewboard.accounts.backends.ldap
+   reviewboard.accounts.backends.nis
+   reviewboard.accounts.backends.registry
+   reviewboard.accounts.backends.standard
+   reviewboard.accounts.backends.x509
    reviewboard.accounts.decorators
    reviewboard.accounts.errors
    reviewboard.accounts.managers
+   reviewboard.accounts.middleware
    reviewboard.accounts.mixins
    reviewboard.accounts.models
    reviewboard.accounts.pages
@@ -115,6 +125,7 @@ Hosting Service Integration
    reviewboard.hostingsvcs.service
    reviewboard.hostingsvcs.testing
    reviewboard.hostingsvcs.testing.testcases
+   reviewboard.hostingsvcs.utils.paginator
 
 
 Integrations

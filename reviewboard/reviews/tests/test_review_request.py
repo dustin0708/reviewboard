@@ -8,6 +8,7 @@ from djblets.testing.decorators import add_fixtures
 from kgb import SpyAgency
 
 from reviewboard.changedescs.models import ChangeDescription
+from reviewboard.diffviewer.models import DiffSet
 from reviewboard.reviews.errors import PublishError
 from reviewboard.reviews.models import (Comment, ReviewRequest,
                                         ReviewRequestDraft)
@@ -22,17 +23,34 @@ class ReviewRequestTests(SpyAgency, TestCase):
 
     fixtures = ['test_users']
 
-    def test_get_close_description_deprecated(self):
-        """Testing ReviewRequest.get_close_description causes deprecation
-        warning
+    @add_fixtures(['test_scmtools'])
+    def test_can_add_default_reviewers_with_no_repository(self):
+        """Testing ReviewRequest.can_add_default_reviewers with no repository
         """
-        review_request = self.create_review_request(publish=True)
+        review_request = self.create_review_request()
 
-        with catch_warnings(record=True) as w:
-            review_request.get_close_description()
-            self.assertEqual(len(w), 1)
-            self.assertTrue(issubclass(w[0].category, DeprecationWarning))
-            self.assertIn("deprecated", six.text_type(w[0].message))
+        with self.assertNumQueries(0):
+            self.assertFalse(review_request.can_add_default_reviewers())
+
+    @add_fixtures(['test_scmtools'])
+    def test_can_add_default_reviewers_with_no_diffs(self):
+        """Testing ReviewRequest.can_add_default_reviewers with no existing
+        diffs
+        """
+        review_request = self.create_review_request(create_repository=True)
+
+        with self.assertNumQueries(1):
+            self.assertTrue(review_request.can_add_default_reviewers())
+
+    @add_fixtures(['test_scmtools'])
+    def test_can_add_default_reviewers_with_diffs(self):
+        """Testing ReviewRequest.can_add_default_reviewers with existing diffs
+        """
+        review_request = self.create_review_request(create_repository=True)
+        self.create_diffset(review_request)
+
+        with self.assertNumQueries(1):
+            self.assertFalse(review_request.can_add_default_reviewers())
 
     def test_get_close_info_returns_correct_information(self):
         """Testing ReviewRequest.get_close_info returns all necessary
@@ -343,6 +361,343 @@ class ReviewRequestTests(SpyAgency, TestCase):
         self.assertEqual(change2.user, doc)
         self.assertEqual(change3.user, grumpy)
         self.assertEqual(change4.user, grumpy)
+
+    @add_fixtures(['test_scmtools'])
+    def test_last_updated(self):
+        """Testing ReviewRequest.last_updated stays in sync with
+        Review.timestamp when a review is published
+        """
+        review_request = self.create_review_request(create_repository=True,
+                                                    publish=True)
+        diffset = self.create_diffset(review_request)
+        filediff = self.create_filediff(diffset)
+
+        review1 = self.create_review(review_request, publish=True)
+        self.assertEqual(review_request.last_updated, review1.timestamp)
+
+        review2 = self.create_review(review_request, publish=True)
+        self.assertEqual(review_request.last_updated, review2.timestamp)
+
+        # Create a diff review.
+        diff_review = self.create_review(review_request)
+        self.create_diff_comment(diff_review, filediff)
+        diff_review.publish()
+        self.assertEqual(review_request.last_updated, diff_review.timestamp)
+
+    @add_fixtures(['test_scmtools'])
+    def test_create_with_history_and_commit_id(self):
+        """Testing ReviewRequest.objects.create when create_with_history=True
+        and create_from_commit_id=True
+        """
+        user = User.objects.get(username='doc')
+        repository = self.create_repository()
+
+        msg = ('create_from_commit_id and create_with_history cannot both be '
+               'set to True.')
+
+        with self.assertRaisesMessage(ValueError, msg):
+            ReviewRequest.objects.create(repository=repository,
+                                         user=user,
+                                         commit_id='0' * 40,
+                                         create_from_commit_id=True,
+                                         create_with_history=True)
+
+    @add_fixtures(['test_scmtools'])
+    def test_created_with_history_cannot_change_when_true(self):
+        """Testing ReviewRequest.created_with_history cannot change after
+        creation when False
+        """
+        user = User.objects.get(username='doc')
+        repository = self.create_repository()
+
+        review_request = ReviewRequest.objects.create(repository=repository,
+                                                      user=user)
+
+        self.assertFalse(review_request.created_with_history)
+
+        msg = ('created_with_history cannot be changed once the review '
+               'request has been created.')
+
+        with self.assertRaisesMessage(ValueError, msg):
+            review_request.created_with_history = True
+
+    @add_fixtures(['test_scmtools'])
+    def test_created_with_history_cannot_change_when_false(self):
+        """Testing ReviewRequest.created_with_history cannot change after
+        creation when True
+        """
+        user = User.objects.get(username='doc')
+        repository = self.create_repository()
+        review_request = ReviewRequest.objects.create(repository=repository,
+                                                      user=user,
+                                                      create_with_history=True)
+
+        self.assertTrue(review_request.created_with_history)
+
+        msg = ('created_with_history cannot be changed once the review '
+               'request has been created.')
+
+        with self.assertRaisesMessage(ValueError, msg):
+            review_request.created_with_history = False
+
+    def test_review_participants_with_reviews(self):
+        """Testing ReviewRequest.review_participants with reviews"""
+        user1 = User.objects.create_user(username='aaa',
+                                         email='user1@example.com')
+        user2 = User.objects.create_user(username='bbb',
+                                         email='user2@example.com')
+        user3 = User.objects.create_user(username='ccc',
+                                         email='user3@example.com')
+        user4 = User.objects.create_user(username='ddd',
+                                         email='user4@example.com')
+
+        review_request = self.create_review_request(publish=True)
+
+        review1 = self.create_review(review_request,
+                                     user=user1,
+                                     publish=True)
+        self.create_reply(review1, user=user2, public=True)
+        self.create_reply(review1, user=user1, public=True)
+
+        review2 = self.create_review(review_request,
+                                     user=user3,
+                                     publish=True)
+        self.create_reply(review2, user=user4, public=False)
+        self.create_reply(review2, user=user3, public=True)
+        self.create_reply(review2, user=user2, public=True)
+
+        self.create_review(review_request, user=user4)
+
+        with self.assertNumQueries(2):
+            self.assertEqual(review_request.review_participants,
+                             {user1, user2, user3})
+
+    def test_review_participants_with_no_reviews(self):
+        """Testing ReviewRequest.review_participants with no reviews"""
+        review_request = self.create_review_request(publish=True)
+
+        with self.assertNumQueries(1):
+            self.assertEqual(review_request.review_participants, set())
+
+    def test_is_accessible_by_with_draft_and_owner(self):
+        """Testing ReviewRequest.is_accessible_by with draft and owner"""
+        review_request = self.create_review_request()
+
+        self.assertTrue(review_request.is_accessible_by(review_request.owner))
+
+    def test_is_accessible_by_with_draft_and_non_owner(self):
+        """Testing ReviewRequest.is_accessible_by with draft and non-owner"""
+        user = self.create_user()
+        review_request = self.create_review_request()
+
+        self.assertFalse(review_request.is_accessible_by(user))
+
+    def test_is_accessible_by_with_draft_and_superuser(self):
+        """Testing ReviewRequest.is_accessible_by with draft and superuser"""
+        user = self.create_user(is_superuser=True)
+        review_request = self.create_review_request()
+
+        self.assertTrue(review_request.is_accessible_by(user))
+
+    @add_fixtures(['test_scmtools'])
+    def test_is_accessible_by_with_private_repo_no_member(self):
+        """Testing ReviewRequest.is_accessible_by with private repository
+        and user not a member
+        """
+        user = self.create_user()
+        repository = self.create_repository(public=False)
+
+        review_request = self.create_review_request(repository=repository,
+                                                    publish=True)
+
+        self.assertFalse(review_request.is_accessible_by(user))
+
+    @add_fixtures(['test_scmtools'])
+    def test_is_accessible_by_with_private_repo_member(self):
+        """Testing ReviewRequest.is_accessible_by with private repository
+        and user is a member
+        """
+        user = self.create_user()
+
+        repository = self.create_repository(public=False)
+        repository.users.add(user)
+
+        review_request = self.create_review_request(repository=repository,
+                                                    publish=True)
+
+        self.assertTrue(review_request.is_accessible_by(user))
+
+    @add_fixtures(['test_scmtools'])
+    def test_is_accessible_by_with_private_repo_member_by_group(self):
+        """Testing ReviewRequest.is_accessible_by with private repository
+        and user is a member by group
+        """
+        user = self.create_user()
+
+        group = self.create_review_group(invite_only=True)
+        group.users.add(user)
+
+        repository = self.create_repository(public=False)
+        repository.review_groups.add(group)
+
+        review_request = self.create_review_request(repository=repository,
+                                                    publish=True)
+
+        self.assertTrue(review_request.is_accessible_by(user))
+
+    def test_is_accessible_by_with_invite_only_group_and_not_member(self):
+        """Testing ReviewRequest.is_accessible_by with invite-only group and
+        user is not a member
+        """
+        user = self.create_user()
+        group = self.create_review_group(invite_only=True)
+
+        review_request = self.create_review_request(publish=True)
+        review_request.target_groups.add(group)
+
+        self.assertFalse(review_request.is_accessible_by(user))
+
+    def test_is_accessible_by_with_invite_only_group_and_member(self):
+        """Testing ReviewRequest.is_accessible_by with invite-only group and
+        user is a member
+        """
+        user = self.create_user()
+
+        group = self.create_review_group(invite_only=True)
+        group.users.add(user)
+
+        review_request = self.create_review_request(publish=True)
+        review_request.target_groups.add(group)
+
+        self.assertTrue(review_request.is_accessible_by(user))
+
+
+class GetLastActivityInfoTests(TestCase):
+    """Unit tests for ReviewRequest.get_last_activity_info"""
+
+    fixtures = ['test_scmtools', 'test_users']
+
+    def setUp(self):
+        super(GetLastActivityInfoTests, self).setUp()
+
+        doc = User.objects.get(username='doc')
+        self.review_request = self.create_review_request(
+            create_repository=True,
+            publish=True,
+            target_people=[doc])
+
+    def test_get_last_activity_info(self):
+        """Testing ReviewRequest.get_last_activity_info"""
+        self.assertEqual(
+            self.review_request.get_last_activity_info(),
+            {
+                'changedesc': None,
+                'timestamp': self.review_request.last_updated,
+                'updated_object': self.review_request,
+            })
+
+    def test_get_last_activity_info_draft(self):
+        """Testing ReviewRequest.get_last_activity_info after updating the
+        draft
+        """
+        draft = ReviewRequestDraft.create(self.review_request)
+        draft.summary = 'A new summary appears'
+        draft.save()
+
+        self.assertEqual(
+            self.review_request.get_last_activity_info(),
+            {
+                'changedesc': None,
+                'timestamp': self.review_request.last_updated,
+                'updated_object': self.review_request,
+            })
+
+    def test_get_last_activity_info_update(self):
+        """Testing ReviewRequest.get_last_activity_info after an update"""
+        draft = ReviewRequestDraft.create(self.review_request)
+        draft.summary = 'A new summary appears'
+        draft.save()
+
+        self.review_request = ReviewRequest.objects.get(
+            pk=self.review_request.pk)
+        self.review_request.publish(user=self.review_request.submitter)
+        changedesc = self.review_request.changedescs.latest()
+
+        self.assertEqual(
+            self.review_request.get_last_activity_info(),
+            {
+                'changedesc': changedesc,
+                'timestamp': changedesc.timestamp,
+                'updated_object': self.review_request,
+            })
+
+    def test_get_last_activity_info_diff_update(self):
+        """Testing ReviewRequest.get_last_activity_info after a diff update"""
+        diffset = self.create_diffset(review_request=self.review_request,
+                                      draft=True)
+        self.review_request.publish(user=self.review_request.submitter)
+        diffset = DiffSet.objects.get(pk=diffset.pk)
+
+        self.assertEqual(
+            self.review_request.get_last_activity_info(),
+            {
+                'changedesc': self.review_request.changedescs.latest(),
+                'timestamp': diffset.timestamp,
+                'updated_object': diffset,
+            })
+
+    def test_get_last_activity_info_review(self):
+        """Testing ReviewRequest.get_last_activity_info after a review"""
+        review = self.create_review(review_request=self.review_request,
+                                    publish=True)
+
+        self.assertEqual(
+            self.review_request.get_last_activity_info(),
+            {
+                'changedesc': None,
+                'timestamp': review.timestamp,
+                'updated_object': review,
+            })
+
+    def test_get_last_activity_info_review_reply(self):
+        """Testing ReviewRequest.get_last_activity_info after a review and
+        a reply
+        """
+        review = self.create_review(review_request=self.review_request,
+                                    publish=True)
+
+        reply = self.create_reply(review=review, publish=True)
+
+        self.assertEqual(
+            self.review_request.get_last_activity_info(),
+            {
+                'changedesc': None,
+                'timestamp': reply.timestamp,
+                'updated_object': reply,
+            })
+
+    def test_get_last_activity_info_update_and_review(self):
+        """Testing ReviewRequest.get_last_activity_info after an update and a
+        review
+        """
+        draft = ReviewRequestDraft.create(self.review_request)
+        draft.summary = 'A new summary appears'
+        draft.save()
+
+        # self.review_request = ReviewRequest.objects.get(
+        #     pk=self.review_request.pk)
+        self.review_request.publish(user=self.review_request.submitter)
+
+        review = self.create_review(review_request=self.review_request,
+                                    publish=True)
+
+        self.assertEqual(
+            self.review_request.get_last_activity_info(),
+            {
+                'changedesc': None,
+                'timestamp': review.timestamp,
+                'updated_object': review,
+            })
 
 
 class IssueCounterTests(TestCase):

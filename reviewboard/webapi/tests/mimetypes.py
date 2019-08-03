@@ -27,8 +27,16 @@ diff_list_mimetype = _build_mimetype('diffs')
 diff_item_mimetype = _build_mimetype('diff')
 
 
+diffcommit_list_mimetype = _build_mimetype('commits')
+diffcommit_item_mimetype = _build_mimetype('commit')
+
+
 diff_file_attachment_list_mimetype = _build_mimetype('diff-file-attachments')
 diff_file_attachment_item_mimetype = _build_mimetype('diff-file-attachment')
+
+
+draft_diffcommit_list_mimetype = _build_mimetype('draft-commits')
+draft_diffcommit_item_mimetype = _build_mimetype('draft-commit')
 
 
 draft_file_attachment_list_mimetype = _build_mimetype('draft-file-attachments')
@@ -119,6 +127,9 @@ review_reply_list_mimetype = _build_mimetype('review-replies')
 review_reply_item_mimetype = _build_mimetype('review-reply')
 
 
+review_request_last_update_mimetype = _build_mimetype('last-update')
+
+
 review_reply_diff_comment_list_mimetype = \
     _build_mimetype('review-reply-diff-comments')
 review_reply_diff_comment_item_mimetype = \
@@ -187,6 +198,9 @@ user_file_attachment_item_mimetype = _build_mimetype('user-file-attachment')
 
 
 validate_diff_mimetype = _build_mimetype('diff-validation')
+
+
+validate_diffcommit_mimetype = _build_mimetype('commit-validation')
 
 
 watched_review_group_list_mimetype = _build_mimetype('watched-review-groups')

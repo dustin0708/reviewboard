@@ -24,6 +24,11 @@ Glossary
        lines with an exclamation point (``!``). Changes that only add
        lines only show one section.
 
+   Cumulative Diff
+       A diff that represents a squashed set of commits, each of which has
+       their own diffs. It is equivalent to applying all of the diffs for all
+       the commits in order.
+
    Default Reviewer
    Default Reviewers
        A feature that allows individual ussers or :term:`review groups` to be
@@ -40,6 +45,18 @@ Glossary
        See the `Wikipedia article
        <https://en.wikipedia.org/wiki/DomainKeys_Identified_Mail>`_ for more
        information.
+
+   DMARC
+       Domain Message Authentication, Reporting & Conformance. This is an
+       e-mail standard for specifying policies around e-mail sender
+       validation, allowing spoofed/malicious e-mails to be rejected or
+       quarantined, amongst other capabilities. See the
+       `Wikipedia article <https://en.wikipedia.org/wiki/DMARC>` and the
+       official `DMARC website <https://dmarc.org/>` for more information.
+
+       Review Board checks DMARC rejection/quarantine policies before
+       attempting to send e-mails on behalf of users. See :ref:`email` for
+       more information.
 
    Draft
        A term used for a review request or review that's been created or

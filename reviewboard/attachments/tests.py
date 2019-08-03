@@ -4,7 +4,7 @@ import mimeparse
 import os
 
 from django.conf import settings
-from django.contrib.auth.models import User
+from django.contrib.auth.models import AnonymousUser, User
 from django.core.cache import cache
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.utils.safestring import SafeText
@@ -14,6 +14,7 @@ from kgb import SpyAgency
 from reviewboard.attachments.forms import UploadFileForm, UploadUserFileForm
 from reviewboard.attachments.mimetypes import (MimetypeHandler,
                                                register_mimetype_handler,
+                                               score_match,
                                                unregister_mimetype_handler)
 from reviewboard.attachments.models import (FileAttachment,
                                             FileAttachmentHistory)
@@ -30,10 +31,10 @@ class BaseFileAttachmentTestCase(TestCase):
         """Create a return a file to use for mocking in forms."""
         filename = os.path.join(settings.STATIC_ROOT,
                                 'rb', 'images', 'logo.png')
-        f = open(filename, 'r')
-        uploaded_file = SimpleUploadedFile(f.name, f.read(),
-                                           content_type='image/png')
-        f.close()
+
+        with open(filename, 'rb') as fp:
+            uploaded_file = SimpleUploadedFile(fp.name, fp.read(),
+                                               content_type='image/png')
 
         return uploaded_file
 
@@ -213,7 +214,7 @@ class FileAttachmentTests(BaseFileAttachmentTestCase):
         """Testing file attachment thumbnail generation for UTF-16 files"""
         filename = os.path.join(os.path.dirname(__file__),
                                 'testdata', 'utf-16.txt')
-        with open(filename) as f:
+        with open(filename, 'rb') as f:
             review_request = self.create_review_request(publish=True)
 
             file = SimpleUploadedFile(
@@ -324,11 +325,12 @@ class UserFileAttachmentTests(BaseFileAttachmentTestCase):
 
         self.assertTrue(file_attachment.is_accessible_by(admin_user))
         self.assertTrue(file_attachment.is_accessible_by(creating_user))
+        self.assertFalse(file_attachment.is_accessible_by(AnonymousUser()))
         self.assertFalse(file_attachment.is_accessible_by(same_site_user))
         self.assertFalse(file_attachment.is_accessible_by(different_site_user))
 
     @add_fixtures(['test_site'])
-    def test_user_file_is_mutably_by(self):
+    def test_user_file_is_mutable_by(self):
         """Testing user FileAttachment.is_mutable_by"""
         creating_user = User.objects.get(username='doc')
         admin_user = User.objects.get(username='admin')
@@ -344,6 +346,7 @@ class UserFileAttachmentTests(BaseFileAttachmentTestCase):
 
         self.assertTrue(file_attachment.is_mutable_by(admin_user))
         self.assertTrue(file_attachment.is_mutable_by(creating_user))
+        self.assertFalse(file_attachment.is_mutable_by(AnonymousUser()))
         self.assertFalse(file_attachment.is_mutable_by(same_site_user))
         self.assertFalse(file_attachment.is_mutable_by(different_site_user))
 
@@ -451,9 +454,6 @@ class MimetypeHandlerTests(TestCase):
         # Handle vendor-specific match
         self.assertEqual(self._handler_for("test/abc+xml"), TestXmlMimetype)
         self.assertEqual(self._handler_for("test2/xml"), Test2AbcXmlMimetype)
-        # Nearest-match for non-matching subtype
-        self.assertEqual(self._handler_for("test2/baz"), Test2AbcXmlMimetype)
-        self.assertEqual(self._handler_for("foo/bar"), StarDefMimetype)
 
     def test_handler_factory_precedence(self):
         """Testing precedence of factory method for mimetype handlers"""
@@ -465,6 +465,22 @@ class MimetypeHandlerTests(TestCase):
         self.assertEqual(self._handler_for("foo/def"), StarDefMimetype)
         # Left match and Wildcard should trump Left Wildcard and match
         self.assertEqual(self._handler_for("test/def"), MimetypeTest)
+
+    def test_mimetype_match_scoring(self):
+        """Testing score_match for different mimetype patterns"""
+        def assert_score(pattern, test, score):
+            self.assertAlmostEqual(
+                score_match(mimeparse.parse_mime_type(pattern),
+                            mimeparse.parse_mime_type(test)),
+                score)
+
+        assert_score('application/reviewboard+x-pdf',
+                     'application/reviewboard+x-pdf', 2.0)
+        assert_score('application/x-pdf', 'application/x-pdf', 1.9)
+        assert_score('text/*', 'text/plain', 1.8)
+        assert_score('*/reviewboard+plain', 'text/reviewboard+plain', 1.7)
+        assert_score('*/plain', 'text/plain', 1.6)
+        assert_score('application/x-javascript', 'application/x-pdf', 0)
 
 
 class FileAttachmentManagerTests(BaseFileAttachmentTestCase):
@@ -631,7 +647,7 @@ class DiffViewerFileAttachmentTests(BaseFileAttachmentTestCase):
         # Create a diff file attachment to be displayed inline.
         diff_file_attachment = FileAttachment.objects.create_from_filediff(
             filediff,
-            filename='my-file',
+            orig_filename='my-file',
             file=self.make_uploaded_file(),
             mimetype='image/png')
         review_request.file_attachments.add(diff_file_attachment)
@@ -665,13 +681,13 @@ class DiffViewerFileAttachmentTests(BaseFileAttachmentTestCase):
 
         orig_attachment = FileAttachment.objects.create_from_filediff(
             filediff,
-            filename='my-file',
+            orig_filename='my-file',
             file=uploaded_file,
             mimetype='image/png',
             from_modified=False)
         modified_attachment = FileAttachment.objects.create_from_filediff(
             filediff,
-            filename='my-file',
+            orig_filename='my-file',
             file=uploaded_file,
             mimetype='image/png')
         review_request.file_attachments.add(orig_attachment)
@@ -735,21 +751,24 @@ class SandboxTests(SpyAgency, BaseFileAttachmentTestCase):
 
     def test_get_thumbnail(self):
         """Testing FileAttachment sandboxes MimetypeHandler.get_thumbnail"""
-        self.spy_on(SandboxMimetypeHandler.get_thumbnail)
+        self.spy_on(SandboxMimetypeHandler.get_thumbnail,
+                    owner=SandboxMimetypeHandler)
 
         self.file_attachment.thumbnail
         self.assertTrue(SandboxMimetypeHandler.get_thumbnail.called)
 
     def test_set_thumbnail(self):
         """Testing FileAttachment sandboxes MimetypeHandler.set_thumbnail"""
-        self.spy_on(SandboxMimetypeHandler.set_thumbnail)
+        self.spy_on(SandboxMimetypeHandler.set_thumbnail,
+                    owner=SandboxMimetypeHandler)
 
         self.file_attachment.thumbnail = None
         self.assertTrue(SandboxMimetypeHandler.set_thumbnail.called)
 
     def test_get_icon_url(self):
         """Testing FileAttachment sandboxes MimetypeHandler.get_icon_url"""
-        self.spy_on(SandboxMimetypeHandler.get_icon_url)
+        self.spy_on(SandboxMimetypeHandler.get_icon_url,
+                    owner=SandboxMimetypeHandler)
 
         self.file_attachment.icon_url
         self.assertTrue(SandboxMimetypeHandler.get_icon_url.called)

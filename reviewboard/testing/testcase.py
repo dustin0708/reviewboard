@@ -7,10 +7,11 @@ from contextlib import contextmanager
 from datetime import timedelta
 
 from django.conf import settings
-from django.contrib.auth.models import User
+from django.contrib.auth.models import Permission, User
 from django.core.cache import cache
 from django.core.files import File
 from django.utils import six, timezone
+from djblets.siteconfig.models import SiteConfiguration
 from djblets.testing.testcases import (FixturesCompilerMixin,
                                        TestCase as DjbletsTestCase)
 from oauthlib.common import generate_token
@@ -18,9 +19,11 @@ from oauth2_provider.models import AccessToken
 
 from reviewboard import scmtools, initialize
 from reviewboard.accounts.models import ReviewRequestVisit
+from reviewboard.admin.siteconfig import load_site_config
 from reviewboard.attachments.models import FileAttachment
 from reviewboard.diffviewer.differ import DiffCompatVersion
-from reviewboard.diffviewer.models import DiffSet, DiffSetHistory, FileDiff
+from reviewboard.diffviewer.models import (DiffCommit, DiffSet, DiffSetHistory,
+                                           FileDiff)
 from reviewboard.notifications.models import WebHookTarget
 from reviewboard.oauth.models import Application
 from reviewboard.reviews.models import (Comment,
@@ -54,7 +57,7 @@ class TestCase(FixturesCompilerMixin, DjbletsTestCase):
 
     ws_re = re.compile(r'\s+')
 
-    DEFAULT_FILEDIFF_DATA = (
+    DEFAULT_FILEDIFF_DATA_DIFF = (
         b'--- README\trevision 123\n'
         b'+++ README\trevision 123\n'
         b'@@ -1 +1 @@\n'
@@ -62,7 +65,7 @@ class TestCase(FixturesCompilerMixin, DjbletsTestCase):
         b'+Hello, everybody!\n'
     )
 
-    DEFAULT_GIT_FILEDIFF_DATA = (
+    DEFAULT_GIT_FILEDIFF_DATA_DIFF = (
         b'diff --git a/README b/README\n'
         b'index 94bdd3e..197009f 100644\n'
         b'--- README\n'
@@ -72,10 +75,56 @@ class TestCase(FixturesCompilerMixin, DjbletsTestCase):
         b'+blah!\n'
     )
 
+    DEFAULT_GIT_README_DIFF = (
+        b'diff --git a/readme b/readme\n'
+        b'index d6613f5..5b50866 100644\n'
+        b'--- a/readme\n'
+        b'+++ b/readme\n'
+        b'@@ -1 +1,3 @@\n'
+        b'Hello there\n'
+        b'+\n'
+        b'+Oh hi!\n'
+    )
+
+    DEFAULT_GIT_FILEMODE_DIFF = (
+        b'diff --git a/testing b/testing\n'
+        b'old mode 100755\n'
+        b'new mode 100644\n'
+        b'index e69de29..bcae657\n'
+        b'--- a/testing\n'
+        b'+++ b/testing\n'
+        b'@@ -0,0 +1 @@\n'
+        b'+ADD\n'
+        b'diff --git a/testing2 b/testing2\n'
+        b'old mode 100644\n'
+        b'new mode 100755\n'
+    )
+
+    DEFAULT_GIT_FILE_NOT_FOUND_DIFF = (
+        b'diff --git a/missing-file b/missing-file\n'
+        b'index d6613f0..5b50866 100644\n'
+        b'--- a/missing-file\n'
+        b'+++ b/missing-file\n'
+        b'@@ -1 +1,3 @@\n'
+        b'Hello there\n'
+        b'+\n'
+        b'+Oh hi!\n'
+    )
+
+    DEFAULT_GIT_BINARY_IMAGE_DIFF = (
+        b'diff --git a/logo.png b/logo.png\n'
+        b'index 86b520c..86b520d\n'
+        b'Binary files a/logo.png and b/logo.png differ\n'
+    )
+
     def setUp(self):
         super(TestCase, self).setUp()
 
-        initialize()
+        siteconfig = SiteConfiguration.objects.get_current()
+        siteconfig.set('mail_from_spoofing', 'never')
+        siteconfig.save(update_fields=('settings',))
+
+        initialize(load_extensions=False)
 
         self._local_sites = {}
 
@@ -110,6 +159,45 @@ class TestCase(FixturesCompilerMixin, DjbletsTestCase):
 
         return self._local_sites[name]
 
+    def create_user(self, username='test-user', password='',
+                    email='test@example.com', perms=None, **kwargs):
+        """Create a User for testing.
+
+        Args:
+            username (unicode, optional):
+                The username.
+
+            password (unicode, optional):
+                The user's password.
+
+            email (unicode, optional):
+                The user's e-mail address.
+
+            perms (list of tuple, optional):
+                A list of permissions to assign. Each item is a tuple
+                of ``(app_label, permission_name)``.
+
+            **kwargs (dict):
+                Additional attributes for the user.
+
+        Returns:
+            django.contrib.auth.models.User:
+            The new User object.
+        """
+        user = User.objects.create(username=username,
+                                   password=password,
+                                   email=email,
+                                   **kwargs)
+
+        if perms:
+            user.user_permissions.add(*[
+                Permission.objects.get(codename=perm_name,
+                                       content_type__app_label=perm_app_label)
+                for perm_app_label, perm_name in perms
+            ])
+
+        return user
+
     def create_webapi_token(self, user, note='Sample note',
                             policy={'access': 'rw'},
                             with_local_site=False,
@@ -136,7 +224,17 @@ class TestCase(FixturesCompilerMixin, DjbletsTestCase):
         with warnings.catch_warnings(record=True) as w:
             # Some warnings such as DeprecationWarning are filtered by
             # default, stop filtering them.
-            warnings.simplefilter("always")
+            warnings.simplefilter('always')
+
+            # Now that we've done that, some warnings may come in that we
+            # really don't want. We want to turn those back off.
+            try:
+                from django.utils.deprecation import RemovedInDjango20Warning
+                warnings.filterwarnings('ignore',
+                                        category=RemovedInDjango20Warning)
+            except ImportError:
+                pass
+
             self.assertEqual(len(w), 0)
 
             yield
@@ -169,13 +267,129 @@ class TestCase(FixturesCompilerMixin, DjbletsTestCase):
         filename = os.path.join(settings.STATIC_ROOT, 'rb', 'images',
                                 'logo.png')
 
-        with open(filename, 'r') as f:
-            file_attachment.file.save(filename, File(f), save=True)
+        with open(filename, 'rb') as f:
+            file_attachment.file.save(os.path.basename(filename), File(f),
+                                      save=True)
 
         if review_request:
             review_request.file_attachments.add(file_attachment)
 
         return file_attachment
+
+    def create_diffcommit(self,
+                          repository=None,
+                          diffset=None,
+                          commit_id='r1',
+                          parent_id='r0',
+                          diff_contents=DEFAULT_GIT_FILEDIFF_DATA_DIFF,
+                          parent_diff_contents=None,
+                          author_name='Author',
+                          author_email='author@example.com',
+                          author_date=None,
+                          commit_message='Commit message',
+                          committer_name='Committer',
+                          committer_email='committer@example.com',
+                          committer_date=None,
+                          **kwargs):
+        """Create a DiffCommit for testing.
+
+        This also creates a
+        :py:class:`reviewboard.diffviewer.models.filediff.FileDiff` attached to
+        the commit.
+
+        Args:
+            repository (reviewboard.scmtools.models.Repository, optional):
+                The repository the commit is associated with.
+
+            diffset (reviewboard.diffviewer.models.diffset.DiffSet, optional):
+                The parent diffset.
+
+            commit_id (unicode, optional):
+                The commit ID.
+
+            parent_id (unicode, optional):
+                The commit ID of the parent commit.
+
+            diff_contents (bytes, optional):
+                The contents of the diff.
+
+            parent_diff_contents (bytes, optional):
+                The contents of the parent diff, if any.
+
+            author_name (unicode, optional):
+                The name of the commit's author.
+
+            author_email (unicode, optional):
+                The e-mail address of the commit's author.
+
+            author_date (datetime.datetime, optional):
+                The date the commit was authored.
+
+            commit_message (unicode, optional):
+                The commit message.
+
+            committer_name (unicode, optional):
+                The name of the committer, if any.
+
+            committer_email (unicode, optional):
+                The e-mail address of the committer, if any.
+
+            committer_date (datetime.datetime, optional):
+                The date the commit was committed, if any.
+
+            **kwargs (dict):
+                Keyword arguments to be passed to the
+                :py:class:`~reviewboard.diffviewer.models.diffcommit.
+                DiffCommit` initializer.
+
+        Returns:
+            reviewboard.diffviewer.models.diffcommit.DiffCommit:
+            The resulting DiffCommit.
+        """
+        assert isinstance(diff_contents, bytes)
+
+        if diffset is None:
+            diffset = self.create_diffset(repository=repository)
+        else:
+            repository = diffset.repository
+
+        if author_date is None:
+            author_date = timezone.now()
+
+        if not committer_date and committer_name and committer_email:
+            committer_date = author_date
+
+        if ((not committer_name and committer_email) or
+            (committer_name and not committer_email)):
+            raise ValueError(
+                'Either both or neither of committer_name and committer_email '
+                'must be provided.')
+
+        if parent_diff_contents:
+            assert isinstance(parent_diff_contents, bytes)
+            parent_diff_file_name = 'parent_diff'
+        else:
+            parent_diff_file_name = None
+
+        return DiffCommit.objects.create_from_data(
+            repository=repository,
+            diff_file_name='diff',
+            diff_file_contents=diff_contents,
+            parent_diff_file_name=parent_diff_file_name,
+            parent_diff_file_contents=parent_diff_contents,
+            diffset=diffset,
+            commit_id=commit_id,
+            parent_id=parent_id,
+            author_name=author_name,
+            author_email=author_email,
+            author_date=author_date,
+            commit_message=commit_message,
+            request=None,
+            committer_name=committer_name,
+            committer_email=committer_email,
+            committer_date=committer_date,
+            check_existence=False,
+            **kwargs)
 
     def create_diffset(self, review_request=None, revision=1, repository=None,
                        draft=False, name='diffset'):
@@ -220,10 +434,11 @@ class TestCase(FixturesCompilerMixin, DjbletsTestCase):
             review (reviewboard.reviews.models.review.Review):
                 The review associated with the comment.
 
-            filediff (reviewboard.diffviewer.models.FileDiff):
+            filediff (reviewboard.diffviewer.models.filediff.FileDiff):
                 The FileDiff associated with the comment.
 
-            interfilediff (reviewboard.diffviewer.models.FileDiff, optional):
+            interfilediff (reviewboard.diffviewer.models.filediff.FileDiff,
+                           optional):
                 The FileDiff used for the end of an interdiff range associated
                 with the comment.
 
@@ -473,14 +688,15 @@ class TestCase(FixturesCompilerMixin, DjbletsTestCase):
     def create_filediff(self, diffset, source_file='/test-file',
                         dest_file='/test-file', source_revision='123',
                         dest_detail='124', status=FileDiff.MODIFIED,
-                        diff=DEFAULT_FILEDIFF_DATA, save=True):
+                        diff=DEFAULT_FILEDIFF_DATA_DIFF, commit=None,
+                        save=True):
         """Create a FileDiff for testing.
 
         The FileDiff is tied to the given DiffSet. It's populated with
         default data that can be overridden by the caller.
 
         Args:
-            diffset (reviewboard.diffviewer.models.DiffSet):
+            diffset (reviewboard.diffviewer.models.diffset.DiffSet):
                 The parent diff set that will own this file.
 
             source_file (unicode, optional):
@@ -504,11 +720,15 @@ class TestCase(FixturesCompilerMixin, DjbletsTestCase):
             diff (bytes, optional):
                 The diff contents.
 
+            commit (reviewboard.diffviewer.models.diffcommit.DiffCommit,
+                    optional):
+                The commit to attach the FileDiff to.
+
             save (bool, optional):
                 Whether to automatically save the resulting object.
 
         Returns:
-            reviewboard.diffviewer.models.FileDiff:
+            reviewboard.diffviewer.models.filediff.FileDiff:
             The resulting FileDiff.
         """
         filediff = FileDiff(
@@ -518,7 +738,8 @@ class TestCase(FixturesCompilerMixin, DjbletsTestCase):
             source_revision=source_revision,
             dest_detail=dest_detail,
             status=status,
-            diff=diff)
+            diff=diff,
+            commit=commit)
 
         if save:
             filediff.save()
@@ -601,31 +822,118 @@ class TestCase(FixturesCompilerMixin, DjbletsTestCase):
 
         return repository
 
-    def create_review_request(self, with_local_site=False, local_site=None,
+    def create_review_request(self,
+                              with_local_site=False,
+                              create_repository=False,
+                              create_with_history=False,
+                              publish=False,
+                              id=None,
+                              local_id=1001,
+                              local_site=None,
+                              repository=None,
+                              time_added=None,
+                              last_updated=None,
+                              status=ReviewRequest.PENDING_REVIEW,
+                              submitter='doc',
                               summary='Test Summary',
                               description='Test Description',
                               testing_done='Testing',
-                              submitter='doc',
                               branch='my-branch',
-                              local_id=1001,
-                              bugs_closed='', status='P', public=False,
-                              publish=False, commit_id=None, changenum=None,
-                              time_added=None, last_updated=None,
-                              repository=None, id=None,
-                              create_repository=False,
+                              depends_on=None,
                               target_people=None,
-                              target_groups=None):
+                              target_groups=None,
+                              **kwargs):
         """Create a ReviewRequest for testing.
 
-        The ReviewRequest may optionally be attached to a LocalSite. It's also
+        The :py:class:`~reviewboard.reviews.models.review_request.
+        ReviewRequest` may optionally be attached to a
+        :py:class:`~reviewboard.site.models.LocalSite`. It's also
         populated with default data that can be overridden by the caller.
 
-        If create_repository is True, a Repository will be created
-        automatically. If set, a custom repository cannot be provided.
+        Args:
+            with_local_site (bool, optional):
+                Whether to create this review request on a default
+                :term:`local site`.
 
-        The provided submitter may either be a username or a User object.
+                This is ignored if ``local_site`` is provided.
 
-        If publish is True, ReviewRequest.publish() will be called.
+            create_repository (bool, optional):
+                Whether to create a new repository in the database for this
+                review request.
+
+                This can't be set if ``repository`` is provided.
+
+            create_with_history (bool, optional):
+                Whether or not the review request should support multiple
+                commits.
+
+            publish (bool, optional):
+                Whether to publish the review request after creation.
+
+            id (int, optional):
+                An explicit database ID to set for the review request.
+
+            local_id (int, optional):
+                The ID specific to the :term:`local site`, if one is used.
+
+            local_site (reviewboard.site.models.LocalSite, optional):
+                The LocalSite to associate the review request with.
+
+                If not provided, the LocalSite with the name specified in
+                :py:attr:`local_site_name` will be used.
+
+            repository (reviewboard.scmtools.models.Repository, optional):
+                An explicit repository to set for the review request.
+
+            time_added (datetime.datetime, optional):
+                An explicit creation timestamp to set for the review request.
+
+            last_updated (datetime.datetime, optional):
+                An explicit last updated timestamp to set for the review
+                request.
+
+            status (unicode, optional):
+                The status of the review request. This must be one of the
+                values listed in :py:attr:`~reviewboard.reviews.models.
+                review_request.ReviewRequest.STATUSES`.
+
+            submitter (unicode or django.contrib.auth.models.User, optional):
+                The submitter of the review request. This can be a username
+                (which will be looked up) or an explicit user.
+
+            summary (unicode, optional):
+                The summary for the review request.
+
+            description (unicode, optional):
+                The description for the review request.
+
+            testing_done (unicode, optional):
+                The Testing Done text for the review request.
+
+            branch (unicode, optional):
+                The branch for the review request.
+
+            depends_on (list of reviewboard.reviews.models.review_request.
+                        ReviewRequest, optional):
+                A list of review requests to set as dependencies.
+
+            target_people (list of django.contrib.auth.models.User, optional):
+                A list of users to set as target reviewers.
+
+            target_groups (list of reviewboard.reviews.models.group.Group,
+                           optional):
+                A list of review groups to set as target reviewers.
+
+            **kwargs (dict):
+                Additional fields to set on the review request.
+
+        Returns:
+            reviewboard.reviews.models.review_request.ReviewRequest:
+            The resulting review request.
+
+        Raises:
+            ValueError:
+                An invalid value was provided during initialization.
         """
         if not local_site:
             if with_local_site:
@@ -655,16 +963,18 @@ class TestCase(FixturesCompilerMixin, DjbletsTestCase):
             submitter=submitter,
             diffset_history=DiffSetHistory.objects.create(),
             repository=repository,
-            public=public,
-            commit_id=commit_id,
-            changenum=changenum,
-            bugs_closed=bugs_closed,
-            status=status)
+            status=status,
+            **kwargs)
+
+        review_request.created_with_history = create_with_history
 
         # Set this separately to avoid issues with CounterField updates.
         review_request.id = id
 
         review_request.save()
+
+        if depends_on:
+            review_request.depends_on = depends_on
 
         if target_people:
             review_request.target_people = target_people
@@ -883,8 +1193,9 @@ class TestCase(FixturesCompilerMixin, DjbletsTestCase):
         filename = os.path.join(settings.STATIC_ROOT, 'rb', 'images',
                                 'logo.png')
 
-        with open(filename, 'r') as f:
-            screenshot.image.save(filename, File(f), save=True)
+        with open(filename, 'rb') as f:
+            screenshot.image.save(os.path.basename(filename), File(f),
+                                  save=True)
 
         if draft:
             if isinstance(draft, ReviewRequestDraft):
@@ -1048,8 +1359,10 @@ class TestCase(FixturesCompilerMixin, DjbletsTestCase):
             file_attachment.orig_filename = orig_filename
             file_attachment.mimetype = 'image/png'
 
-            with open(filename, 'r') as f:
-                file_attachment.file.save(filename, File(f), save=True)
+            with open(filename, 'rb') as f:
+                file_attachment.file.save(os.path.basename(filename),
+                                          File(f),
+                                          save=True)
 
         file_attachment.save()
 
@@ -1334,22 +1647,27 @@ class TestCase(FixturesCompilerMixin, DjbletsTestCase):
         )
 
     @contextmanager
-    def override_siteconfig(self, **kwargs):
-        """A context manager that temporarily sets siteconfig values."""
-        if not hasattr(self, 'siteconfig'):
-            raise Exception('TestCase does not have self.siteconfig')
+    def siteconfig_settings(self, settings, reload_settings=True):
+        """Temporarily sets siteconfig settings for a test.
 
-        defaults = self.siteconfig.get_defaults()
+        Args:
+            settings (dict):
+                The new siteconfig settings to set.
 
-        for key, value in six.iteritems(kwargs):
-            self.siteconfig.set(key, value)
+            reload_settings (bool, optional):
+                Whether to reload and recompute all settings, applying them
+                to Django and other objects.
 
-        self.siteconfig.save()
-
+        Context:
+            The current site configuration will contain the new settings for
+            this test.
+        """
         try:
-            yield
-        finally:
-            for key in six.iterkeys(kwargs):
-                self.siteconfig.set(key, defaults.get(key))
+            with super(TestCase, self).siteconfig_settings(settings):
+                if reload_settings:
+                    load_site_config()
 
-        self.siteconfig.save()
+                yield
+        finally:
+            if reload_settings:
+                load_site_config()

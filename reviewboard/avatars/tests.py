@@ -47,6 +47,14 @@ class AvatarServiceRegistryTests(AvatarServicesTestMixin, TestCase):
 
         self.registry = AvatarServiceRegistry()
         self.siteconfig = SiteConfiguration.objects.get_current()
+        self._old_siteconfig_settings = self.siteconfig.settings.copy()
+
+    def tearDown(self):
+        super(AvatarServiceRegistryTests, self).tearDown()
+
+        if self.siteconfig.settings != self._old_siteconfig_settings:
+            self.siteconfig.settings = self._old_siteconfig_settings
+            self.siteconfig.save()
 
     def test_defaults(self):
         """Testing AvatarServiceRegistry default services state"""
@@ -343,8 +351,8 @@ class TemplateTagTests(AvatarServicesTestMixin, TestCase):
             })),
             ('{'
              '"1x": "%(1x)s", '
-             '"3x": "%(3x)s", '
-             '"2x": "%(2x)s"'
+             '"2x": "%(2x)s", '
+             '"3x": "%(3x)s"'
              '}'
              % service.get_avatar_urls_uncached(self.user, 32))
         )
@@ -390,7 +398,7 @@ class TemplateTagTests(AvatarServicesTestMixin, TestCase):
             t.render(RequestContext(self.request, {
                 'u': self.user,
             })),
-            '{}')
+            '{"1x": "", "2x": "", "3x": ""}')
 
     def test_avatar_urls_service_not_found(self):
         """Testing {% avatar_urls %} template tag with an invalid service"""
@@ -412,8 +420,8 @@ class TemplateTagTests(AvatarServicesTestMixin, TestCase):
             })),
             ('{'
              '"1x": "%(1x)s", '
-             '"3x": "%(3x)s", '
-             '"2x": "%(2x)s"'
+             '"2x": "%(2x)s", '
+             '"3x": "%(3x)s"'
              '}'
              % service.get_avatar_urls_uncached(self.user, 32))
         )
@@ -439,7 +447,6 @@ class TemplateTagTests(AvatarServicesTestMixin, TestCase):
 
     def test_avatar_specific_service(self):
         """Testing {% avatar %} template tag using a specific avatar service"""
-
         avatar_services.register(DummyAvatarService)
         avatar_services.enable_service(DummyAvatarService)
 
@@ -454,12 +461,45 @@ class TemplateTagTests(AvatarServicesTestMixin, TestCase):
             })),
             ('<img src="http://example.com/avatar.png" alt="%s" width="32"'
              ' height="32" srcset="http://example.com/avatar.png 1x"'
-             ' class="avatar">\n'
-             % self.user.get_full_name() or self.user.username)
+             ' class="avatar djblets-o-avatar">\n'
+             % self.user.username)
         )
 
+    def test_avatar_with_string_size_valid(self):
+        """Testing {% avatar %} template tag with string-encoded int size"""
+        avatar_services.register(DummyAvatarService)
+        avatar_services.enable_service(DummyAvatarService)
+
+        template = Template('{% load avatars %}'
+                            '{% avatar target_user "32" avatar_service_id %}')
+
+        self.assertHTMLEqual(
+            template.render(RequestContext(self.request, {
+                'target_user': self.user,
+                'avatar_service_id': DummyAvatarService.avatar_service_id,
+            })),
+            ('<img src="http://example.com/avatar.png" alt="%s" width="32"'
+             ' height="32" srcset="http://example.com/avatar.png 1x"'
+             ' class="avatar djblets-o-avatar">\n'
+             % self.user.username))
+
+    def test_avatar_with_string_size_invalid(self):
+        """Testing {% avatar %} template tag with invalid string size"""
+        avatar_services.register(DummyAvatarService)
+        avatar_services.enable_service(DummyAvatarService)
+
+        template = Template('{% load avatars %}'
+                            '{% avatar target_user "ABC" avatar_service_id %}')
+
+        self.assertEqual(
+            template.render(RequestContext(self.request, {
+                'target_user': self.user,
+                'avatar_service_id': DummyAvatarService.avatar_service_id,
+            })),
+            '')
+
     def test_avatar_invalid_service(self):
-        """Test {% avatar %} template tag rendering with an invalid avatar
+        """Testing {% avatar %} template tag rendering with an invalid avatar
         service
         """
         t = Template('{% load avatars %}'
@@ -480,6 +520,8 @@ class TemplateTagTests(AvatarServicesTestMixin, TestCase):
         t = Template('{% load avatars %}'
                      '{% avatar target_user 32 avatar_service_id %}')
 
+        self.request.user = User.objects.get(username='admin')
+
         user = User.objects.create_user(
             first_name='<b>Bad',
             last_name='User</b>',
@@ -487,8 +529,6 @@ class TemplateTagTests(AvatarServicesTestMixin, TestCase):
             email='bad_user@example.com')
 
         Profile.objects.create(user=user)
-
-        escaped_user = escape(user.get_full_name())
 
         avatar_services.register(DummyAvatarService)
         avatar_services.enable_service(DummyAvatarService)
@@ -500,8 +540,8 @@ class TemplateTagTests(AvatarServicesTestMixin, TestCase):
             })),
             '<img src="http://example.com/avatar.png" alt="%s" width="32"'
             ' height="32" srcset="http://example.com/avatar.png 1x"'
-            ' class="avatar">\n'
-            % escaped_user)
+            ' class="avatar djblets-o-avatar">\n'
+            % '&lt;b&gt;Bad User&lt;/b&gt;')
 
 
 class FileUploadServiceTests(SpyAgency, AvatarServicesTestMixin, TestCase):
@@ -526,7 +566,8 @@ class FileUploadServiceTests(SpyAgency, AvatarServicesTestMixin, TestCase):
         storage_cls = get_storage_class()
 
         self.spy_on(storage_cls.save,
-                    call_fake=lambda self, filename, data: filename)
+                    owner=storage_cls,
+                    call_fake=lambda self, name, *args, **kwargs: name)
 
         form = AvatarSettingsForm(
             None,

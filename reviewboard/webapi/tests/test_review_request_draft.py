@@ -1,15 +1,19 @@
-from __future__ import unicode_literals
+from __future__ import print_function, unicode_literals
 
 from django.contrib import auth
 from django.contrib.auth.models import Permission, User
 from django.core import mail
 from django.utils import six
+from djblets.features.testing import override_feature_check
 from djblets.testing.decorators import add_fixtures
-from djblets.webapi.errors import PERMISSION_DENIED
+from djblets.webapi.errors import INVALID_FORM_DATA, PERMISSION_DENIED
+from djblets.webapi.testing.decorators import webapi_test_template
 from kgb import SpyAgency
 
-from reviewboard.accounts.backends import AuthBackend
+from reviewboard.accounts.backends import AuthBackend, StandardAuthBackend
 from reviewboard.accounts.models import LocalSiteProfile
+from reviewboard.changedescs.models import ChangeDescription
+from reviewboard.diffviewer.features import dvcs_feature
 from reviewboard.reviews.fields import (BaseEditableField,
                                         BaseTextAreaField,
                                         BaseReviewRequestField,
@@ -17,7 +21,9 @@ from reviewboard.reviews.fields import (BaseEditableField,
 from reviewboard.reviews.models import ReviewRequest, ReviewRequestDraft
 from reviewboard.reviews.signals import (review_request_published,
                                          review_request_publishing)
-from reviewboard.webapi.errors import NOTHING_TO_PUBLISH
+from reviewboard.webapi.errors import (COMMIT_ID_ALREADY_EXISTS,
+                                       NOTHING_TO_PUBLISH,
+                                       PUBLISH_ERROR)
 from reviewboard.webapi.resources import resources
 from reviewboard.webapi.tests.base import BaseWebAPITestCase
 from reviewboard.webapi.tests.mimetypes import \
@@ -41,7 +47,8 @@ class ResourceTests(SpyAgency, ExtraDataListMixin, ExtraDataItemMixin,
 
         self.assertEqual(item_rsp['description'], draft.description)
         self.assertEqual(item_rsp['testing_done'], draft.testing_done)
-        self.assertEqual(item_rsp['extra_data'], draft.extra_data)
+        self.assertEqual(item_rsp['extra_data'],
+                         self.resource.serialize_extra_data_field(draft))
         self.assertEqual(item_rsp['changedescription'], changedesc.text)
 
         if changedesc.rich_text:
@@ -461,26 +468,6 @@ class ResourceTests(SpyAgency, ExtraDataListMixin, ExtraDataItemMixin,
         draft = ReviewRequestDraft.create(review_request)
         self.compare_item(item_rsp, draft)
 
-    def test_put_with_changedesc(self):
-        """Testing the PUT review-requests/<id>/draft/ API
-        with a change description
-        """
-        changedesc = 'This is a test change description.'
-        review_request = self.create_review_request(submitter=self.user,
-                                                    publish=True)
-
-        rsp = self.api_post(
-            get_review_request_draft_url(review_request),
-            {'changedescription': changedesc},
-            expected_mimetype=review_request_draft_item_mimetype)
-
-        self.assertEqual(rsp['stat'], 'ok')
-        self.assertEqual(rsp['draft']['changedescription'], changedesc)
-
-        draft = ReviewRequestDraft.objects.get(pk=rsp['draft']['id'])
-        self.assertNotEqual(draft.changedesc, None)
-        self.assertEqual(draft.changedesc.text, changedesc)
-
     def test_put_with_no_changes(self):
         """Testing the PUT review-requests/<id>/draft/ API
         with no changes made to the fields
@@ -490,6 +477,9 @@ class ResourceTests(SpyAgency, ExtraDataListMixin, ExtraDataItemMixin,
 
         ReviewRequestDraft.create(review_request)
 
+        self.spy_on(ChangeDescription.save, owner=ChangeDescription)
+        self.spy_on(ReviewRequestDraft.save, owner=ReviewRequestDraft)
+
         rsp = self.api_put(
             get_review_request_draft_url(review_request),
             {'public': True},
@@ -497,6 +487,9 @@ class ResourceTests(SpyAgency, ExtraDataListMixin, ExtraDataItemMixin,
 
         self.assertEqual(rsp['stat'], 'fail')
         self.assertEqual(rsp['err']['code'], NOTHING_TO_PUBLISH.code)
+
+        self.assertFalse(ChangeDescription.save.called)
+        self.assertFalse(ReviewRequestDraft.save.called)
 
     def test_put_with_text_type_markdown(self):
         """Testing the PUT review-requests/<id>/draft/ API
@@ -508,7 +501,10 @@ class ResourceTests(SpyAgency, ExtraDataListMixin, ExtraDataItemMixin,
             expected_change_text_type='markdown',
             expected_description_text_type='markdown',
             expected_testing_done_text_type='markdown',
-            expected_custom_field_text_type='markdown')
+            expected_custom_field_text_type='markdown',
+            expected_changedesc_update_fields=['rich_text'],
+            expected_draft_update_fields=['description_rich_text',
+                                          'testing_done_rich_text'])
 
     def test_put_with_text_type_plain(self):
         """Testing the PUT review-requests/<id>/draft/ API
@@ -520,7 +516,10 @@ class ResourceTests(SpyAgency, ExtraDataListMixin, ExtraDataItemMixin,
             expected_change_text_type='plain',
             expected_description_text_type='plain',
             expected_testing_done_text_type='plain',
-            expected_custom_field_text_type='plain')
+            expected_custom_field_text_type='plain',
+            expected_changedesc_update_fields=['rich_text'],
+            expected_draft_update_fields=['description_rich_text',
+                                          'testing_done_rich_text'])
 
     def test_put_with_changedescription_text_type_markdown(self):
         """Testing the PUT review-requests/<id>/draft/ API
@@ -532,7 +531,8 @@ class ResourceTests(SpyAgency, ExtraDataListMixin, ExtraDataItemMixin,
             expected_change_text_type='markdown',
             expected_description_text_type='plain',
             expected_testing_done_text_type='plain',
-            expected_custom_field_text_type='markdown')
+            expected_custom_field_text_type='markdown',
+            expected_changedesc_update_fields=['rich_text'])
 
     def test_put_with_changedescription_text_type_plain(self):
         """Testing the PUT review-requests/<id>/draft/ API
@@ -544,7 +544,8 @@ class ResourceTests(SpyAgency, ExtraDataListMixin, ExtraDataItemMixin,
             expected_change_text_type='plain',
             expected_description_text_type='plain',
             expected_testing_done_text_type='plain',
-            expected_custom_field_text_type='markdown')
+            expected_custom_field_text_type='markdown',
+            expected_changedesc_update_fields=['rich_text'])
 
     def test_put_with_description_text_type_markdown(self):
         """Testing the PUT review-requests/<id>/draft/ API
@@ -556,7 +557,8 @@ class ResourceTests(SpyAgency, ExtraDataListMixin, ExtraDataItemMixin,
             expected_change_text_type='plain',
             expected_description_text_type='markdown',
             expected_testing_done_text_type='plain',
-            expected_custom_field_text_type='markdown')
+            expected_custom_field_text_type='markdown',
+            expected_draft_update_fields=['description_rich_text'])
 
     def test_put_with_description_text_type_plain(self):
         """Testing the PUT review-requests/<id>/draft/ API
@@ -568,7 +570,8 @@ class ResourceTests(SpyAgency, ExtraDataListMixin, ExtraDataItemMixin,
             expected_change_text_type='plain',
             expected_description_text_type='plain',
             expected_testing_done_text_type='plain',
-            expected_custom_field_text_type='markdown')
+            expected_custom_field_text_type='markdown',
+            expected_draft_update_fields=['description_rich_text'])
 
     def test_put_with_testing_done_text_type_markdown(self):
         """Testing the PUT review-requests/<id>/draft/ API
@@ -580,7 +583,8 @@ class ResourceTests(SpyAgency, ExtraDataListMixin, ExtraDataItemMixin,
             expected_change_text_type='plain',
             expected_description_text_type='plain',
             expected_testing_done_text_type='markdown',
-            expected_custom_field_text_type='markdown')
+            expected_custom_field_text_type='markdown',
+            expected_draft_update_fields=['testing_done_rich_text'])
 
     def test_put_with_testing_done_text_type_plain(self):
         """Testing the PUT review-requests/<id>/draft/ API
@@ -592,7 +596,8 @@ class ResourceTests(SpyAgency, ExtraDataListMixin, ExtraDataItemMixin,
             expected_change_text_type='plain',
             expected_description_text_type='plain',
             expected_testing_done_text_type='plain',
-            expected_custom_field_text_type='markdown')
+            expected_custom_field_text_type='markdown',
+            expected_draft_update_fields=['testing_done_rich_text'])
 
     def test_put_with_custom_field_text_type_markdown(self):
         """Testing the PUT review-requests/<id>/draft/ API
@@ -618,10 +623,99 @@ class ResourceTests(SpyAgency, ExtraDataListMixin, ExtraDataItemMixin,
             expected_testing_done_text_type='plain',
             expected_custom_field_text_type='plain')
 
+    @webapi_test_template
+    def test_put_with_branch(self):
+        """Testing the PUT <URL> API with branch field"""
+        review_request = self.create_review_request(submitter=self.user,
+                                                    publish=True)
+        ReviewRequestDraft.create(review_request)
+
+        self.spy_on(ChangeDescription.save, owner=ChangeDescription)
+        self.spy_on(ReviewRequestDraft.save, owner=ReviewRequestDraft)
+
+        rsp = self.api_put(
+            get_review_request_draft_url(review_request),
+            {
+                'branch': 'new branch',
+            },
+            expected_mimetype=review_request_draft_item_mimetype)
+
+        self.assertEqual(rsp['stat'], 'ok')
+        self.assertEqual(rsp['draft']['branch'], 'new branch')
+
+        draft = ReviewRequestDraft.objects.get(pk=rsp['draft']['id'])
+        self.assertEqual(draft.branch, 'new branch')
+
+        self.assertFalse(ChangeDescription.save.called)
+        self.assertTrue(ReviewRequestDraft.save.last_called_with(
+            update_fields=['branch', 'last_updated']))
+
+    @webapi_test_template
+    def test_put_with_bugs_closed(self):
+        """Testing the PUT <URL> API with bugs_closed field"""
+        review_request = self.create_review_request(submitter=self.user,
+                                                    publish=True)
+        ReviewRequestDraft.create(review_request)
+
+        self.spy_on(ChangeDescription.save, owner=ChangeDescription)
+        self.spy_on(ReviewRequestDraft.save, owner=ReviewRequestDraft)
+
+        rsp = self.api_put(
+            get_review_request_draft_url(review_request),
+            {
+                'bugs_closed': '10,20, 300,,',
+            },
+            expected_mimetype=review_request_draft_item_mimetype)
+
+        self.assertEqual(rsp['stat'], 'ok')
+        self.assertEqual(rsp['draft']['bugs_closed'], ['10', '20', '300'])
+
+        draft = ReviewRequestDraft.objects.get(pk=rsp['draft']['id'])
+        self.assertEqual(draft.get_bug_list(), ['10', '20', '300'])
+
+        self.assertFalse(ChangeDescription.save.called)
+        self.assertTrue(ReviewRequestDraft.save.last_called_with(
+            update_fields=['bugs_closed', 'last_updated']))
+
+    @webapi_test_template
+    def test_put_with_changedescription(self):
+        """Testing the PUT <URL> with a change description"""
+        review_request = self.create_review_request(submitter=self.user,
+                                                    publish=True)
+        ReviewRequestDraft.create(review_request)
+
+        self.spy_on(ChangeDescription.save, owner=ChangeDescription)
+        self.spy_on(ReviewRequestDraft.save, owner=ReviewRequestDraft)
+
+        changedesc = 'This is a test change description.'
+
+        rsp = self.api_put(
+            get_review_request_draft_url(review_request),
+            {
+                'changedescription': changedesc,
+            },
+            expected_mimetype=review_request_draft_item_mimetype)
+
+        self.assertEqual(rsp['stat'], 'ok')
+        self.assertEqual(rsp['draft']['changedescription'], changedesc)
+
+        draft = ReviewRequestDraft.objects.get(pk=rsp['draft']['id'])
+        self.assertIsNotNone(draft.changedesc)
+        self.assertEqual(draft.changedesc.text, changedesc)
+
+        self.assertTrue(ChangeDescription.save.last_called_with(
+            update_fields=['text']))
+        self.assertFalse(ReviewRequestDraft.save.called)
+
     def test_put_with_commit_id(self):
         """Testing the PUT review-requests/<id>/draft/ API with commit_id"""
         review_request = self.create_review_request(submitter=self.user,
                                                     publish=True)
+        ReviewRequestDraft.create(review_request)
+
+        self.spy_on(ChangeDescription.save, owner=ChangeDescription)
+        self.spy_on(ReviewRequestDraft.save, owner=ReviewRequestDraft)
+
         commit_id = 'abc123'
 
         rsp = self.api_put(
@@ -630,6 +724,7 @@ class ResourceTests(SpyAgency, ExtraDataListMixin, ExtraDataItemMixin,
                 'commit_id': commit_id,
             },
             expected_mimetype=review_request_draft_item_mimetype)
+
         self.assertEqual(rsp['stat'], 'ok')
         self.assertEqual(rsp['draft']['commit_id'], commit_id)
         self.assertEqual(rsp['draft']['summary'], review_request.summary)
@@ -638,6 +733,10 @@ class ResourceTests(SpyAgency, ExtraDataListMixin, ExtraDataItemMixin,
 
         review_request = ReviewRequest.objects.get(pk=review_request.pk)
         self.assertNotEqual(review_request.commit_id, commit_id)
+
+        self.assertFalse(ChangeDescription.save.called)
+        self.assertTrue(ReviewRequestDraft.save.last_called_with(
+            update_fields=['commit_id', 'last_updated']))
 
     def test_put_with_commit_id_and_used_in_review_request(self):
         """Testing the PUT review-requests/<id>/draft/ API with commit_id
@@ -652,15 +751,24 @@ class ResourceTests(SpyAgency, ExtraDataListMixin, ExtraDataItemMixin,
         review_request = self.create_review_request(submitter=self.user,
                                                     publish=True)
 
-        self.api_put(
+        self.spy_on(ChangeDescription.save, owner=ChangeDescription)
+        self.spy_on(ReviewRequestDraft.save, owner=ReviewRequestDraft)
+
+        rsp = self.api_put(
             get_review_request_draft_url(review_request),
             {
                 'commit_id': commit_id,
             },
             expected_status=409)
 
+        self.assertEqual(rsp['stat'], 'fail')
+        self.assertEqual(rsp['err']['code'], COMMIT_ID_ALREADY_EXISTS.code)
+
         review_request = ReviewRequest.objects.get(pk=review_request.pk)
-        self.assertIsNone(review_request.commit_id, None)
+        self.assertIsNone(review_request.commit_id)
+
+        self.assertFalse(ChangeDescription.save.called)
+        self.assertFalse(ReviewRequestDraft.save.called)
 
     def test_put_with_commit_id_and_used_in_draft(self):
         """Testing the PUT review-requests/<id>/draft/ API with commit_id
@@ -673,25 +781,38 @@ class ResourceTests(SpyAgency, ExtraDataListMixin, ExtraDataItemMixin,
             publish=True)
         existing_draft = ReviewRequestDraft.create(existing_review_request)
         existing_draft.commit_id = commit_id
-        existing_draft.save()
+        existing_draft.save(update_fields=('commit_id',))
 
         review_request = self.create_review_request(submitter=self.user,
                                                     publish=True)
 
-        self.api_put(
+        self.spy_on(ChangeDescription.save, owner=ChangeDescription)
+        self.spy_on(ReviewRequestDraft.save, owner=ReviewRequestDraft)
+
+        rsp = self.api_put(
             get_review_request_draft_url(review_request),
             {
                 'commit_id': commit_id,
             },
             expected_status=409)
 
+        self.assertEqual(rsp['stat'], 'fail')
+        self.assertEqual(rsp['err']['code'], COMMIT_ID_ALREADY_EXISTS.code)
+
         review_request = ReviewRequest.objects.get(pk=review_request.pk)
-        self.assertIsNone(review_request.commit_id, None)
+        self.assertIsNone(review_request.commit_id)
+
+        self.assertFalse(ChangeDescription.save.called)
+        self.assertFalse(ReviewRequestDraft.save.called)
 
     def test_put_with_commit_id_empty_string(self):
         """Testing the PUT review-requests/<id>/draft/ API with commit_id=''"""
         review_request = self.create_review_request(submitter=self.user,
                                                     publish=True)
+        ReviewRequestDraft.create(review_request)
+
+        self.spy_on(ChangeDescription.save, owner=ChangeDescription)
+        self.spy_on(ReviewRequestDraft.save, owner=ReviewRequestDraft)
 
         rsp = self.api_put(
             get_review_request_draft_url(review_request),
@@ -699,11 +820,15 @@ class ResourceTests(SpyAgency, ExtraDataListMixin, ExtraDataItemMixin,
                 'commit_id': '',
             },
             expected_mimetype=review_request_draft_item_mimetype)
+
         self.assertEqual(rsp['stat'], 'ok')
         self.assertIsNone(rsp['draft']['commit_id'])
 
         review_request = ReviewRequest.objects.get(pk=review_request.pk)
         self.assertIsNone(review_request.commit_id)
+
+        self.assertFalse(ChangeDescription.save.called)
+        self.assertFalse(ReviewRequestDraft.save.called)
 
     @add_fixtures(['test_scmtools'])
     def test_put_with_commit_id_with_update_from_commit_id(self):
@@ -714,7 +839,12 @@ class ResourceTests(SpyAgency, ExtraDataListMixin, ExtraDataItemMixin,
         review_request = self.create_review_request(submitter=self.user,
                                                     repository=repository,
                                                     publish=True)
+        ReviewRequestDraft.create(review_request)
+
         commit_id = 'abc123'
+
+        self.spy_on(ChangeDescription.save, owner=ChangeDescription)
+        self.spy_on(ReviewRequestDraft.save, owner=ReviewRequestDraft)
 
         rsp = self.api_put(
             get_review_request_draft_url(review_request),
@@ -723,6 +853,7 @@ class ResourceTests(SpyAgency, ExtraDataListMixin, ExtraDataItemMixin,
                 'update_from_commit_id': True,
             },
             expected_mimetype=review_request_draft_item_mimetype)
+
         self.assertEqual(rsp['stat'], 'ok')
         self.assertEqual(rsp['draft']['commit_id'], commit_id)
         self.assertEqual(rsp['draft']['summary'], 'Commit summary')
@@ -730,6 +861,18 @@ class ResourceTests(SpyAgency, ExtraDataListMixin, ExtraDataItemMixin,
 
         review_request = ReviewRequest.objects.get(pk=review_request.pk)
         self.assertNotEqual(review_request.commit_id, commit_id)
+        self.assertNotEqual(review_request.description, 'Commit description.')
+        self.assertNotEqual(review_request.summary, 'Commit summary')
+
+        draft = review_request.get_draft()
+        self.assertEqual(draft.commit_id, commit_id)
+        self.assertEqual(draft.description, 'Commit description.')
+        self.assertEqual(draft.summary, 'Commit summary')
+
+        self.assertFalse(ChangeDescription.save.called)
+        self.assertTrue(ReviewRequestDraft.save.last_called_with(
+            update_fields=['commit_id', 'description', 'description_rich_text',
+                           'diffset', 'last_updated', 'summary']))
 
     def test_put_with_depends_on(self):
         """Testing the PUT review-requests/<id>/draft/ API
@@ -737,6 +880,7 @@ class ResourceTests(SpyAgency, ExtraDataListMixin, ExtraDataItemMixin,
         """
         review_request = self.create_review_request(submitter=self.user,
                                                     publish=True)
+        ReviewRequestDraft.create(review_request)
 
         depends_1 = self.create_review_request(
             summary='Dependency 1',
@@ -745,9 +889,14 @@ class ResourceTests(SpyAgency, ExtraDataListMixin, ExtraDataItemMixin,
             summary='Dependency 2',
             publish=True)
 
+        self.spy_on(ChangeDescription.save, owner=ChangeDescription)
+        self.spy_on(ReviewRequestDraft.save, owner=ReviewRequestDraft)
+
         rsp = self.api_put(
             get_review_request_draft_url(review_request),
-            {'depends_on': '%s, %s' % (depends_1.pk, depends_2.pk)},
+            {
+                'depends_on': '%s, %s,,' % (depends_1.pk, depends_2.pk),
+            },
             expected_mimetype=review_request_draft_item_mimetype)
 
         self.assertEqual(rsp['stat'], 'ok')
@@ -764,6 +913,10 @@ class ResourceTests(SpyAgency, ExtraDataListMixin, ExtraDataItemMixin,
         self.assertEqual(list(depends_1.draft_blocks.all()), [draft])
         self.assertEqual(list(depends_2.draft_blocks.all()), [draft])
 
+        self.assertFalse(ChangeDescription.save.called)
+        self.assertTrue(ReviewRequestDraft.save.last_called_with(
+            update_fields=['last_updated']))
+
     @add_fixtures(['test_site'])
     def test_put_with_depends_on_and_site(self):
         """Testing the PUT review-requests/<id>/draft/ API
@@ -771,6 +924,7 @@ class ResourceTests(SpyAgency, ExtraDataListMixin, ExtraDataItemMixin,
         """
         review_request = self.create_review_request(submitter='doc',
                                                     with_local_site=True)
+        ReviewRequestDraft.create(review_request)
 
         self._login_user(local_site=True)
 
@@ -783,6 +937,9 @@ class ResourceTests(SpyAgency, ExtraDataListMixin, ExtraDataItemMixin,
 
         # This isn't the review request we want to match.
         bad_depends = self.create_review_request(id=3, publish=True)
+
+        self.spy_on(ChangeDescription.save, owner=ChangeDescription)
+        self.spy_on(ReviewRequestDraft.save, owner=ReviewRequestDraft)
 
         rsp = self.api_put(
             get_review_request_draft_url(review_request, self.local_site_name),
@@ -803,22 +960,430 @@ class ResourceTests(SpyAgency, ExtraDataListMixin, ExtraDataItemMixin,
         self.assertEqual(list(depends_1.draft_blocks.all()), [draft])
         self.assertEqual(bad_depends.draft_blocks.count(), 0)
 
+        self.assertFalse(ChangeDescription.save.called)
+        self.assertTrue(ReviewRequestDraft.save.last_called_with(
+            update_fields=['last_updated']))
+
     def test_put_with_depends_on_invalid_id(self):
         """Testing the PUT review-requests/<id>/draft/ API
         with depends_on field and invalid ID
         """
         review_request = self.create_review_request(submitter=self.user,
                                                     publish=True)
+        ReviewRequestDraft.create(review_request)
+
+        self.spy_on(ChangeDescription.save, owner=ChangeDescription)
+        self.spy_on(ReviewRequestDraft.save, owner=ReviewRequestDraft)
 
         rsp = self.api_put(
             get_review_request_draft_url(review_request),
-            {'depends_on': '10000'},
+            {
+                'depends_on': '10000,https://blah/,/r/123/,BUG-123',
+            },
             expected_status=400)
 
         self.assertEqual(rsp['stat'], 'fail')
+        self.assertEqual(rsp['err']['code'], INVALID_FORM_DATA.code)
+        self.assertEqual(rsp['draft']['depends_on'], [])
+        self.assertEqual(rsp['fields'], {
+            'depends_on': ['10000', 'https://blah/', '/r/123/', 'BUG-123'],
+        })
 
         draft = review_request.get_draft()
         self.assertEqual(draft.depends_on.count(), 0)
+
+        self.assertFalse(ChangeDescription.save.called)
+        self.assertFalse(ReviewRequestDraft.save.called)
+
+    @webapi_test_template
+    def test_put_with_depends_on_and_emptying_list(self):
+        """Testing the PUT <URL> API with depends_on emptying an existing
+        list
+        """
+        dep1 = self.create_review_request(submitter=self.user,
+                                          summary='Dep 1',
+                                          publish=True)
+        dep2 = self.create_review_request(submitter=self.user,
+                                          summary='Dep 2',
+                                          publish=True)
+        self.create_review_request(submitter=self.user,
+                                   summary='Dep 3',
+                                   publish=True)
+
+        review_request = self.create_review_request(submitter=self.user)
+        draft = ReviewRequestDraft.create(review_request)
+        draft.depends_on.add(dep1, dep2)
+
+        rsp = self.api_put(
+            get_review_request_draft_url(review_request, None),
+            {
+                'depends_on': ''
+            },
+            expected_mimetype=review_request_draft_item_mimetype)
+
+        self.assertEqual(rsp['stat'], 'ok')
+        self.assertEqual(rsp['draft']['depends_on'], [])
+
+        draft = ReviewRequestDraft.objects.get(pk=draft.pk)
+        self.assertEqual(draft.depends_on.count(), 0)
+
+    @webapi_test_template
+    def test_put_with_summary(self):
+        """Testing the PUT <URL> API with summary field"""
+        review_request = self.create_review_request(submitter=self.user,
+                                                    publish=True)
+        ReviewRequestDraft.create(review_request)
+
+        self.spy_on(ChangeDescription.save, owner=ChangeDescription)
+        self.spy_on(ReviewRequestDraft.save, owner=ReviewRequestDraft)
+
+        rsp = self.api_put(
+            get_review_request_draft_url(review_request),
+            {
+                'summary': 'New summary',
+            },
+            expected_mimetype=review_request_draft_item_mimetype)
+
+        self.assertEqual(rsp['stat'], 'ok')
+        self.assertEqual(rsp['draft']['summary'], 'New summary')
+
+        draft = ReviewRequestDraft.objects.get(pk=rsp['draft']['id'])
+        self.assertEqual(draft.summary, 'New summary')
+
+        self.assertFalse(ChangeDescription.save.called)
+        self.assertTrue(ReviewRequestDraft.save.last_called_with(
+            update_fields=['last_updated', 'summary']))
+
+    @webapi_test_template
+    def test_put_with_summary_with_newline(self):
+        """Testing the PUT <URL> API with summary field containing newline"""
+        review_request = self.create_review_request(submitter=self.user,
+                                                    publish=True)
+        ReviewRequestDraft.create(review_request)
+
+        self.spy_on(ChangeDescription.save, owner=ChangeDescription)
+        self.spy_on(ReviewRequestDraft.save, owner=ReviewRequestDraft)
+
+        rsp = self.api_put(
+            get_review_request_draft_url(review_request),
+            {
+                'summary': 'New summary\nbah',
+            },
+            expected_status=400)
+
+        self.assertEqual(rsp['stat'], 'fail')
+        self.assertEqual(rsp['err']['code'], INVALID_FORM_DATA.code)
+        self.assertEqual(rsp['draft']['target_groups'], [])
+        self.assertTrue(rsp['fields'], {
+            'summary': ["The summary can't contain a newline"],
+        })
+
+        draft = ReviewRequestDraft.objects.get(pk=rsp['draft']['id'])
+        self.assertEqual(draft.summary, 'Test Summary')
+
+        self.assertFalse(ChangeDescription.save.called)
+        self.assertFalse(ReviewRequestDraft.save.called)
+
+    @webapi_test_template
+    def test_put_with_target_groups(self):
+        """Testing the PUT <URL> API with target_groups field"""
+        group1 = self.create_review_group(name='group1')
+        group2 = self.create_review_group(name='group2')
+
+        review_request = self.create_review_request(submitter=self.user,
+                                                    publish=True)
+        ReviewRequestDraft.create(review_request)
+
+        self.spy_on(ChangeDescription.save, owner=ChangeDescription)
+        self.spy_on(ReviewRequestDraft.save, owner=ReviewRequestDraft)
+
+        rsp = self.api_put(
+            get_review_request_draft_url(review_request),
+            {
+                'target_groups': 'group1,group2',
+            },
+            expected_mimetype=review_request_draft_item_mimetype)
+
+        self.assertEqual(rsp['stat'], 'ok')
+        self.assertEqual(
+            rsp['draft']['target_groups'],
+            [
+                {
+                    'href': 'http://testserver/api/groups/group1/',
+                    'method': 'GET',
+                    'title': 'group1',
+                },
+                {
+                    'href': 'http://testserver/api/groups/group2/',
+                    'method': 'GET',
+                    'title': 'group2',
+                },
+            ])
+
+        draft = ReviewRequestDraft.objects.get(pk=rsp['draft']['id'])
+        self.assertEqual(list(draft.target_groups.all()),
+                         [group1, group2])
+
+        self.assertFalse(ChangeDescription.save.called)
+        self.assertTrue(ReviewRequestDraft.save.last_called_with(
+            update_fields=['last_updated']))
+
+    @add_fixtures(['test_site'])
+    @webapi_test_template
+    def test_put_with_target_groups_with_local_site(self):
+        """Testing the PUT <URL> API with target_groups field and Local Site
+        draft
+        """
+        self.user = self._login_user(local_site=True)
+
+        review_request = self.create_review_request(submitter=self.user,
+                                                    with_local_site=True,
+                                                    publish=True)
+        ReviewRequestDraft.create(review_request)
+
+        local_site = review_request.local_site
+
+        group1 = self.create_review_group(name='group1',
+                                          local_site=local_site)
+        group2 = self.create_review_group(name='group2',
+                                          local_site=local_site)
+
+        self.spy_on(ChangeDescription.save, owner=ChangeDescription)
+        self.spy_on(ReviewRequestDraft.save, owner=ReviewRequestDraft)
+
+        rsp = self.api_put(
+            get_review_request_draft_url(review_request, local_site),
+            {
+                'target_groups': 'group1,group2',
+            },
+            expected_mimetype=review_request_draft_item_mimetype)
+
+        self.assertEqual(rsp['stat'], 'ok')
+        self.assertEqual(
+            rsp['draft']['target_groups'],
+            [
+                {
+                    'href': 'http://testserver/s/local-site-1/'
+                            'api/groups/group1/',
+                    'method': 'GET',
+                    'title': 'group1',
+                },
+                {
+                    'href': 'http://testserver/s/local-site-1/'
+                            'api/groups/group2/',
+                    'method': 'GET',
+                    'title': 'group2',
+                },
+            ])
+
+        draft = ReviewRequestDraft.objects.get(pk=rsp['draft']['id'])
+        self.assertEqual(list(draft.target_groups.all()),
+                         [group1, group2])
+
+        self.assertFalse(ChangeDescription.save.called)
+        self.assertTrue(ReviewRequestDraft.save.last_called_with(
+            update_fields=['last_updated']))
+
+    @add_fixtures(['test_site'])
+    @webapi_test_template
+    def test_put_with_target_groups_with_local_site_and_global_group(self):
+        """Testing the PUT <URL> API with target_groups field and Local Site
+        draft with global group
+        """
+        self.user = self._login_user(local_site=True)
+
+        review_request = self.create_review_request(submitter=self.user,
+                                                    with_local_site=True,
+                                                    publish=True)
+        ReviewRequestDraft.create(review_request)
+
+        local_site = review_request.local_site
+
+        self.create_review_group(name='group1', local_site=local_site)
+        self.create_review_group(name='group2')
+
+        self.spy_on(ChangeDescription.save, owner=ChangeDescription)
+        self.spy_on(ReviewRequestDraft.save, owner=ReviewRequestDraft)
+
+        rsp = self.api_put(
+            get_review_request_draft_url(review_request, local_site),
+            {
+                'target_groups': 'group1,group2',
+            },
+            expected_status=400)
+
+        self.assertEqual(rsp['stat'], 'fail')
+        self.assertEqual(rsp['err']['code'], INVALID_FORM_DATA.code)
+        self.assertEqual(rsp['draft']['target_groups'], [])
+        self.assertTrue(rsp['fields'], {
+            'target_groups': ['group2'],
+        })
+
+        draft = ReviewRequestDraft.objects.get(pk=rsp['draft']['id'])
+        self.assertFalse(draft.target_groups.exists())
+
+        self.assertFalse(ChangeDescription.save.called)
+        self.assertFalse(ReviewRequestDraft.save.called)
+
+    @webapi_test_template
+    def test_put_with_target_groups_and_emptying_list(self):
+        """Testing the PUT <URL> API with target_groups emptying an existing
+        list
+        """
+        group1 = self.create_review_group(name='group1')
+        group2 = self.create_review_group(name='group2')
+        self.create_review_group(name='group3')
+
+        review_request = self.create_review_request(submitter=self.user)
+        draft = ReviewRequestDraft.create(review_request)
+        draft.target_groups.add(group1, group2)
+
+        rsp = self.api_put(
+            get_review_request_draft_url(review_request, None),
+            {
+                'target_groups': ''
+            },
+            expected_mimetype=review_request_draft_item_mimetype)
+
+        self.assertEqual(rsp['stat'], 'ok')
+        self.assertEqual(rsp['draft']['target_groups'], [])
+
+        draft = ReviewRequestDraft.objects.get(pk=draft.pk)
+        self.assertEqual(draft.target_groups.count(), 0)
+
+    @webapi_test_template
+    def test_put_with_target_people_and_emptying_list(self):
+        """Testing the PUT <URL> API with target_people emptying an existing
+        list
+        """
+        reviewer = User.objects.create(username='reviewer')
+
+        review_request = self.create_review_request(submitter=self.user)
+        draft = ReviewRequestDraft.create(review_request)
+        draft.target_people.add(reviewer)
+
+        rsp = self.api_put(
+            get_review_request_draft_url(review_request, None),
+            {
+                'target_people': ''
+            },
+            expected_mimetype=review_request_draft_item_mimetype)
+
+        self.assertEqual(rsp['stat'], 'ok')
+        self.assertEqual(rsp['draft']['target_people'], [])
+
+        draft = ReviewRequestDraft.objects.get(pk=draft.pk)
+        self.assertEqual(draft.target_people.count(), 0)
+
+    @webapi_test_template
+    def test_put_with_target_people_and_invalid_user(self):
+        """Testing the PUT <URL> API with target_people containing invalid
+        username
+        """
+        review_request = self.create_review_request(submitter=self.user)
+        draft = ReviewRequestDraft.create(review_request)
+
+        self.spy_on(ChangeDescription.save, owner=ChangeDescription)
+        self.spy_on(ReviewRequestDraft.save, owner=ReviewRequestDraft)
+
+        rsp = self.api_put(
+            get_review_request_draft_url(review_request, None),
+            {
+                'target_people': 'invalid'
+            },
+            expected_status=INVALID_FORM_DATA.http_status)
+
+        self.assertEqual(rsp['stat'], 'fail')
+        self.assertEqual(rsp['err']['code'], INVALID_FORM_DATA.code)
+        self.assertEqual(rsp['fields'], {
+            'target_people': ['invalid'],
+        })
+        self.assertEqual(rsp['draft']['target_people'], [])
+
+        draft = ReviewRequestDraft.objects.get(pk=draft.pk)
+        self.assertFalse(draft.target_people.exists())
+
+        self.assertFalse(ChangeDescription.save.called)
+        self.assertFalse(ReviewRequestDraft.save.called)
+
+    @webapi_test_template
+    def test_put_with_target_people_and_auth_backend_lookup(self):
+        """Testing the PUT <URL> API with target_people and unknown user
+        lookup in auth backend
+        """
+        def _get_or_create_user(*args, **kwargs):
+            return User.objects.create(username='backend-user')
+
+        review_request = self.create_review_request(submitter=self.user)
+        draft = ReviewRequestDraft.create(review_request)
+
+        self.spy_on(ChangeDescription.save, owner=ChangeDescription)
+        self.spy_on(ReviewRequestDraft.save, owner=ReviewRequestDraft)
+        self.spy_on(StandardAuthBackend.get_or_create_user,
+                    owner=StandardAuthBackend,
+                    call_fake=_get_or_create_user)
+
+        rsp = self.api_put(
+            get_review_request_draft_url(review_request, None),
+            {
+                'target_people': 'backend-user',
+            },
+            expected_mimetype=review_request_draft_item_mimetype)
+
+        self.assertEqual(rsp['stat'], 'ok')
+        self.assertEqual(rsp['draft']['target_people'], [
+            {
+                'href': 'http://testserver/api/users/backend-user/',
+                'method': 'GET',
+                'title': 'backend-user',
+            },
+        ])
+
+        self.assertTrue(StandardAuthBackend.get_or_create_user.called_with(
+            username='backend-user'))
+
+        draft = ReviewRequestDraft.objects.get(pk=draft.pk)
+        self.assertEqual(draft.target_people.count(), 1)
+        self.assertEqual(draft.target_people.get().username, 'backend-user')
+
+        self.assertFalse(ChangeDescription.save.called)
+        self.assertTrue(ReviewRequestDraft.save.last_called_with(
+            update_fields=['last_updated']))
+
+    @webapi_test_template
+    def test_put_with_target_people_and_auth_backend_lookup_error(self):
+        """Testing the PUT <URL> API with target_people and unknown user
+        lookup in auth backend errors
+        """
+        def _get_or_create_user(*args, **kwargs):
+            raise Exception()
+
+        self.spy_on(StandardAuthBackend.get_or_create_user,
+                    owner=StandardAuthBackend,
+                    call_fake=_get_or_create_user)
+
+        review_request = self.create_review_request(submitter=self.user)
+        draft = ReviewRequestDraft.create(review_request)
+
+        rsp = self.api_put(
+            get_review_request_draft_url(review_request, None),
+            {
+                'target_people': 'unknown',
+            },
+            expected_status=INVALID_FORM_DATA.http_status)
+
+        self.assertEqual(rsp['stat'], 'fail')
+        self.assertEqual(rsp['err']['code'], INVALID_FORM_DATA.code)
+        self.assertEqual(rsp['fields'], {
+            'target_people': ['unknown'],
+        })
+        self.assertEqual(rsp['draft']['target_people'], [])
+
+        self.assertTrue(StandardAuthBackend.get_or_create_user.called_with(
+            username='unknown'))
+
+        draft = ReviewRequestDraft.objects.get(pk=draft.pk)
+        self.assertFalse(draft.target_people.exists())
 
     def test_put_with_permission_denied_error(self):
         """Testing the PUT review-requests/<id>/draft/ API
@@ -838,25 +1403,29 @@ class ResourceTests(SpyAgency, ExtraDataListMixin, ExtraDataItemMixin,
 
     def test_put_publish(self):
         """Testing the PUT review-requests/<id>/draft/?public=1 API"""
-        self.siteconfig.set('mail_send_review_mail', True)
-        self.siteconfig.save()
+        # We need to send e-mail out for both the initial review request
+        # publish and the draft publish in order for the latter to have a
+        # "Re:" in the subject.
+        with self.siteconfig_settings({'mail_send_review_mail': True},
+                                      reload_settings=False):
+            review_request = self.create_review_request(submitter=self.user,
+                                                        publish=True)
+            draft = ReviewRequestDraft.create(review_request)
+            draft.summary = 'My Summary'
+            draft.description = 'My Description'
+            draft.testing_done = 'My Testing Done'
+            draft.branch = 'My Branch'
+            draft.target_people.add(User.objects.get(username='doc'))
+            draft.save()
 
-        review_request = self.create_review_request(submitter=self.user,
-                                                    publish=True)
-        draft = ReviewRequestDraft.create(review_request)
-        draft.summary = 'My Summary'
-        draft.description = 'My Description'
-        draft.testing_done = 'My Testing Done'
-        draft.branch = 'My Branch'
-        draft.target_people.add(User.objects.get(username='doc'))
-        draft.save()
+            # Since we're only testing for the draft's publish e-mail,
+            # clear the outbox.
+            mail.outbox = []
 
-        mail.outbox = []
-
-        rsp = self.api_put(
-            get_review_request_draft_url(review_request),
-            {'public': True},
-            expected_mimetype=review_request_draft_item_mimetype)
+            rsp = self.api_put(
+                get_review_request_draft_url(review_request),
+                {'public': True},
+                expected_mimetype=review_request_draft_item_mimetype)
 
         self.assertEqual(rsp['stat'], 'ok')
 
@@ -875,7 +1444,8 @@ class ResourceTests(SpyAgency, ExtraDataListMixin, ExtraDataItemMixin,
 
     def test_put_publish_with_new_submitter(self):
         """Testing the PUT review-requests/<id>/draft/?public=1 API
-        with new submitter"""
+        with new submitter
+        """
         review_request = self.create_review_request(submitter=self.user,
                                                     publish=True)
         draft = ReviewRequestDraft.create(review_request)
@@ -898,9 +1468,6 @@ class ResourceTests(SpyAgency, ExtraDataListMixin, ExtraDataItemMixin,
         """Testing the PUT review-requests/<id>/draft/?public=1 API
         with a new review request
         """
-        self.siteconfig.set('mail_send_review_mail', True)
-        self.siteconfig.save()
-
         # Set some data first.
         review_request = self.create_review_request(submitter=self.user)
         review_request.target_people = [
@@ -908,12 +1475,15 @@ class ResourceTests(SpyAgency, ExtraDataListMixin, ExtraDataItemMixin,
         ]
         review_request.save()
 
-        self._create_update_review_request(self.api_put, 200, review_request)
+        self._create_update_review_request(self.api_put, 200,
+                                           review_request)
 
-        rsp = self.api_put(
-            get_review_request_draft_url(review_request),
-            {'public': True},
-            expected_mimetype=review_request_draft_item_mimetype)
+        with self.siteconfig_settings({'mail_send_review_mail': True},
+                                      reload_settings=False):
+            rsp = self.api_put(
+                get_review_request_draft_url(review_request),
+                {'public': True},
+                expected_mimetype=review_request_draft_item_mimetype)
 
         self.assertEqual(rsp['stat'], 'ok')
 
@@ -955,12 +1525,9 @@ class ResourceTests(SpyAgency, ExtraDataListMixin, ExtraDataItemMixin,
 
         local_site = self.get_local_site(name=self.local_site_name)
 
-        site_profile = LocalSiteProfile.objects.create(
-            local_site=local_site,
-            user=self.user,
-            profile=self.user.get_profile())
+        site_profile = self.user.get_site_profile(local_site)
         site_profile.permissions['reviews.can_edit_reviewrequest'] = True
-        site_profile.save()
+        site_profile.save(update_fields=('permissions',))
 
         self._test_put_as_other_user(local_site)
 
@@ -974,35 +1541,28 @@ class ResourceTests(SpyAgency, ExtraDataListMixin, ExtraDataItemMixin,
         self._test_put_as_other_user(
             self.get_local_site(name=self.local_site_name))
 
-    def test_put_find_user_fails(self):
-        """Testing the PUT review-requests/<id>/draft/ API
-        with _find_user failure
+    def test_put_with_invalid_submitter(self):
+        """Testing the PUT review-requests/<id>/draft/ API with an invalid
+        submitter
         """
-        self.spy_on(resources.review_request_draft._find_user,
-                    call_fake=lambda *args, **kwargs: None)
-
-        review_request = self.create_review_request(
-            submitter=self.user)
-
-        ReviewRequestDraft.create(review_request)
+        review_request = self.create_review_request(submitter=self.user,
+                                                    publish=True)
 
         rsp = self.api_put(
-            get_review_request_draft_url(review_request, None),
+            get_review_request_draft_url(review_request),
             {
-                'target_people': 'grumpy'
+                'submitter': 'invalid',
             },
-            expected_status=400)
+            expected_status=INVALID_FORM_DATA.http_status)
+
         self.assertEqual(rsp['stat'], 'fail')
-        self.assertEqual(rsp['err']['code'], 105)
-        self.assertTrue(resources.review_request_draft._find_user.called)
+        self.assertEqual(rsp['err']['code'], INVALID_FORM_DATA.code)
+        self.assertTrue('submitter' in rsp['fields'])
 
     def test_put_with_publish_and_trivial(self):
         """Testing the PUT review-requests/<id>/draft/ API with trivial
         changes
         """
-        self.siteconfig.set('mail_send_review_mail', True)
-        self.siteconfig.save()
-
         review_request = self.create_review_request(submitter=self.user,
                                                     publish=True)
         draft = ReviewRequestDraft.create(review_request)
@@ -1013,15 +1573,15 @@ class ResourceTests(SpyAgency, ExtraDataListMixin, ExtraDataItemMixin,
         draft.target_people.add(User.objects.get(username='doc'))
         draft.save()
 
-        mail.outbox = []
-
-        rsp = self.api_put(
-            get_review_request_draft_url(review_request),
-            {
-                'public': True,
-                'trivial': True,
-            },
-            expected_mimetype=review_request_draft_item_mimetype)
+        with self.siteconfig_settings({'mail_send_review_mail': True},
+                                      reload_settings=False):
+            rsp = self.api_put(
+                get_review_request_draft_url(review_request),
+                {
+                    'public': True,
+                    'trivial': True,
+                },
+                expected_mimetype=review_request_draft_item_mimetype)
 
         self.assertEqual(rsp['stat'], 'ok')
 
@@ -1231,7 +1791,9 @@ class ResourceTests(SpyAgency, ExtraDataListMixin, ExtraDataItemMixin,
         self.spy_on(auth.get_backends, call_fake=lambda: [backend])
 
         # The first spy messes with permissions, this lets it through
-        self.spy_on(ReviewRequest.is_mutable_by, call_fake=lambda x, y: True)
+        self.spy_on(ReviewRequest.is_mutable_by,
+                    owner=ReviewRequest,
+                    call_fake=lambda x, y: True)
         self.spy_on(backend.get_or_create_user)
 
         review_request = self.create_review_request(
@@ -1248,6 +1810,77 @@ class ResourceTests(SpyAgency, ExtraDataListMixin, ExtraDataItemMixin,
 
         self.assertEqual(rsp['stat'], 'fail')
         self.assertTrue(backend.get_or_create_user.called)
+
+    @add_fixtures(['test_scmtools'])
+    @webapi_test_template
+    def test_put_created_with_history_public_unfinalized_series(self):
+        """Testing the PUT <URL> API with public=1 for a review request
+        created with commit history support that has an unfinalized diffset
+        """
+        with override_feature_check(dvcs_feature.feature_id, enabled=True):
+            review_request = self.create_review_request(
+                create_with_history=True,
+                create_repository=True,
+                submitter=self.user)
+            diffset = self.create_diffset(review_request, draft=True)
+            draft = review_request.get_draft()
+
+            self.create_diffcommit(diffset=diffset)
+
+            draft.target_people = [review_request.submitter]
+            draft.save()
+
+            rsp = self.api_put(
+                get_review_request_draft_url(review_request),
+                {'public': True},
+                expected_status=500)
+
+            self.assertEqual(rsp, {
+                'stat': 'fail',
+                'err': {
+                    'code': PUBLISH_ERROR.code,
+                    'msg': 'Error publishing: This commit series is not '
+                           'finalized.',
+                },
+            })
+
+            # If the draft still exists we indeed did not publish!
+            self.assertTrue(
+                ReviewRequestDraft.objects.filter(pk=draft.pk).exists())
+
+    @add_fixtures(['test_scmtools'])
+    @webapi_test_template
+    def test_put_created_with_history_public_finalized_series(self):
+        """Testing the PUT <URL> API with public=1 for a review request
+        created with commit history support that has a finalized diffset
+        """
+        with override_feature_check(dvcs_feature.feature_id, enabled=True):
+            review_request = self.create_review_request(
+                create_with_history=True,
+                create_repository=True,
+                submitter=self.user)
+            diffset = self.create_diffset(review_request, draft=True)
+            draft = review_request.get_draft()
+
+            self.create_diffcommit(diffset=diffset)
+
+            draft.target_people = [review_request.submitter]
+            draft.save()
+
+            diffset.finalize_commit_series(
+                cumulative_diff=self.DEFAULT_GIT_FILEDIFF_DATA_DIFF,
+                validation_info=None,
+                validate=False,
+                save=True)
+
+            rsp = self.api_put(
+                get_review_request_draft_url(review_request),
+                {'public': True},
+                expected_mimetype=review_request_draft_item_mimetype)
+
+            self.assertEqual(rsp['stat'], 'ok')
+
+            self.assertFalse(ReviewRequestDraft.objects.exists())
 
     def _create_update_review_request(self, api_func, expected_status,
                                       review_request=None,
@@ -1479,7 +2112,9 @@ class ResourceTests(SpyAgency, ExtraDataListMixin, ExtraDataItemMixin,
                                   expected_change_text_type,
                                   expected_description_text_type,
                                   expected_testing_done_text_type,
-                                  expected_custom_field_text_type):
+                                  expected_custom_field_text_type,
+                                  expected_changedesc_update_fields=[],
+                                  expected_draft_update_fields=[]):
         text = '`This` is a **test**'
 
         class CustomField(BaseTextAreaField):
@@ -1491,6 +2126,10 @@ class ResourceTests(SpyAgency, ExtraDataListMixin, ExtraDataItemMixin,
         try:
             review_request = self.create_review_request(submitter=self.user,
                                                         publish=True)
+            ReviewRequestDraft.create(review_request)
+
+            self.spy_on(ChangeDescription.save, owner=ChangeDescription)
+            self.spy_on(ReviewRequestDraft.save, owner=ReviewRequestDraft)
 
             rsp = self.api_put(
                 get_review_request_draft_url(review_request),
@@ -1522,6 +2161,14 @@ class ResourceTests(SpyAgency, ExtraDataListMixin, ExtraDataItemMixin,
 
             draft = ReviewRequestDraft.objects.get(pk=rsp['draft']['id'])
             self.compare_item(draft_rsp, draft)
+
+            self.assertTrue(ChangeDescription.save.last_called_with(
+                update_fields=sorted(['text'] +
+                                     expected_changedesc_update_fields)))
+            self.assertTrue(ReviewRequestDraft.save.last_called_with(
+                update_fields=sorted(['description', 'extra_data',
+                                      'last_updated', 'testing_done'] +
+                                     expected_draft_update_fields)))
         finally:
             fieldset.remove_field(CustomField)
 

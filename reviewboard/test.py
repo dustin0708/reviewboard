@@ -10,6 +10,7 @@ import os
 import sys
 
 from django.conf import settings
+from django.contrib import admin
 from djblets.testing.testrunners import TestRunner
 
 
@@ -20,6 +21,12 @@ class RBTestRunner(TestRunner):
     test_packages = settings.TEST_PACKAGES
 
     needs_collect_static = True
+
+    nose_options = [
+        '-v',
+        '--match=^test',
+        '--with-id'
+    ]
 
     def run_tests(self, *args, **kwargs):
         """Run the test suite.
@@ -45,10 +52,16 @@ class RBTestRunner(TestRunner):
                              '--with-profile instead.\n')
             sys.exit(1)
 
+        # Load in all the models for the admin UI, so tests have access to
+        # admin URLS.
+        admin.autodiscover()
+
         return super(RBTestRunner, self).run_tests(*args, **kwargs)
 
     def setup_dirs(self):
         settings.SITE_DATA_DIR = os.path.join(self.tempdir, 'data')
+        settings.HAYSTACK_CONNECTIONS['default']['PATH'] = \
+            os.path.join(settings.SITE_DATA_DIR, 'search-index')
         images_dir = os.path.join(settings.MEDIA_ROOT, 'uploaded', 'images')
 
         return super(RBTestRunner, self).setup_dirs() + [

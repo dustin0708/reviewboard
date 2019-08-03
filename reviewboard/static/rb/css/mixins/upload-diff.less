@@ -1,16 +1,6 @@
 @import (reference) "../defs.less";
 
 .upload-diff-ui() {
-  #prompt-for-basedir,
-  #prompt-for-diff,
-  #prompt-for-parent-diff,
-  #prompt-for-change-number,
-  #processing-diff,
-  #uploading-diffs,
-  #error-indicator {
-    display: none;
-  }
-
   #processing-diff,
   #uploading-diffs {
     .spinner {
@@ -35,7 +25,6 @@
 
   .input {
     border-radius: @box-border-radius;
-    background-color: lighten(@light-grey, 10%);
     position: relative;
     text-align: center;
     vertical-align: middle;
@@ -49,7 +38,6 @@
   }
 
   .drag-hover {
-    border: 1px solid darken(@grey, 4%);
     box-shadow: inset @box-shadow;
   }
 }

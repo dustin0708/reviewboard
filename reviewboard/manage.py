@@ -1,14 +1,21 @@
 #!/usr/bin/env python
 
-from __future__ import unicode_literals
+from __future__ import print_function, unicode_literals
 
 import os
+import shutil
 import subprocess
 import sys
+from datetime import datetime
 from os.path import abspath, dirname
 from wsgiref import simple_server
 
 from django.core.management import execute_from_command_line
+
+from reviewboard.dependencies import (PYTHON_2_MIN_VERSION,
+                                      PYTHON_2_MIN_VERSION_STR,
+                                      PYTHON_3_MIN_VERSION,
+                                      PYTHON_3_MIN_VERSION_STR)
 
 
 def check_dependencies(settings):
@@ -24,8 +31,12 @@ def check_dependencies(settings):
 
     # Make sure the correct version of Python is being used. This should be
     # covered by setup.py, but it's best to make sure here.
-    if sys.version_info[0] != 2 or sys.version_info[1] != 7:
-        dependency_error('Python 2.7 is required.')
+    pyver = sys.version_info[:2]
+
+    if pyver < PYTHON_2_MIN_VERSION or (3, 0) <= pyver < PYTHON_3_MIN_VERSION:
+        dependency_error('Python %s or %s+ is required.'
+                         % (PYTHON_2_MIN_VERSION_STR,
+                            PYTHON_3_MIN_VERSION_STR))
 
     # Check for NodeJS and installed modules, to make sure these weren't
     # missed during installation.
@@ -104,26 +115,90 @@ def check_dependencies(settings):
     fail_if_missing_dependencies()
 
 
-def include_enabled_extensions(settings):
+def upgrade_database():
+    """Perform an upgrade of the database.
+
+    This will prompt the user for confirmation, with instructions on what
+    will happen. If the database is using SQLite3, it will be backed up
+    automatically, making a copy that contains the current timestamp.
+    Otherwise, the user will be prompted to back it up instead.
+
+    Returns:
+        bool:
+        ``True`` if the user has confirmed the upgrade. ``False`` if they
+        have not.
     """
-    This adds enabled extensions to the INSTALLED_APPS cache
-    so that operations like syncdb and evolve will take extensions
-    into consideration.
-    """
-    from django.db.models.loading import load_app
-    from django.db import DatabaseError
+    from django.conf import settings
+    from django.utils.six.moves import input
 
-    from reviewboard.extensions.base import get_extension_manager
+    database = settings.DATABASES['default']
+    db_name = database['NAME']
+    backup_db_name = None
 
-    try:
-        manager = get_extension_manager()
-    except DatabaseError:
-        # This database is from a time before extensions, so don't attempt to
-        # load any extensions yet.
-        return
+    # See if we can make a backup of the database.
+    if ('--no-backup' not in sys.argv and
+        database['ENGINE'] == 'django.db.backends.sqlite3' and
+        os.path.exists(db_name)):
+        # Make a copy of the database.
+        backup_db_name = '%s.%s' % (
+            db_name,
+            datetime.now().strftime('%Y%m%d.%H%M%S'))
 
-    for extension in manager.get_enabled_extensions():
-        load_app(extension.info.app_name)
+        try:
+            shutil.copy(db_name, backup_db_name)
+        except Exception as e:
+            sys.stderr.write('Unable to make a backup of your database at '
+                             '%s: %s\n\n'
+                             % (db_name, e))
+            backup_db_name = None
+
+    if '--noinput' in sys.argv:
+        if backup_db_name:
+            print (
+                'Your existing database has been backed up to\n'
+                '%s\n'
+                % backup_db_name
+            )
+
+        perform_upgrade = True
+    else:
+        message = (
+            'You are about to upgrade your database, which cannot be undone.'
+            '\n\n'
+        )
+
+        if backup_db_name:
+            message += (
+                'Your existing database has been backed up to\n'
+                '%s'
+                % backup_db_name
+            )
+        else:
+            message += 'PLEASE MAKE A BACKUP BEFORE YOU CONTINUE!'
+
+        message += '\n\nType "yes" to continue or "no" to cancel: '
+
+        perform_upgrade = input(message).lower() in ('yes', 'y')
+
+        print('\n')
+
+    if perform_upgrade:
+        print(
+            '===========================================================\n'
+            'Performing the database upgrade. Any "unapplied evolutions"\n'
+            'will be handled automatically.\n'
+            '===========================================================\n'
+        )
+
+        commands = [
+            ['evolve', '--noinput', '--execute']
+        ]
+
+        for command in commands:
+            execute_from_command_line([sys.argv[0]] + command)
+    else:
+        print('The upgrade has been cancelled.\n')
+        sys.exit(1)
 
 
 def main(settings, in_subprocess):
@@ -134,28 +209,42 @@ def main(settings, in_subprocess):
                          "Review Board source tree.\n")
         sys.exit(1)
 
-    if (len(sys.argv) > 1 and
-        (sys.argv[1] == 'runserver' or sys.argv[1] == 'test')):
+    try:
+        command_name = sys.argv[1]
+    except IndexError:
+        command_name = None
+
+    if command_name in ('runserver', 'test'):
         if settings.DEBUG and not in_subprocess:
             sys.stderr.write('Running dependency checks (set DEBUG=False '
                              'to turn this off)...\n')
             check_dependencies(settings)
 
-        if sys.argv[1] == 'runserver':
+        if command_name == 'runserver':
             # Force using HTTP/1.1 for all responses, in order to work around
             # some browsers (Chrome) failing to consistently handle some
             # cache headers.
             simple_server.ServerHandler.http_version = '1.1'
-    else:
+    elif command_name not in ('evolve', 'syncdb', 'migrate'):
         # Some of our checks require access to django.conf.settings, so
         # tell Django about our settings.
         #
         # Initialize Review Board, so we're in a state ready to load
         # extensions and run management commands.
+        #
+        # Note that we don't do this for operations that may create the
+        # database, since we don't want to run the risk of initialization
+        # callbacks causing database creation to fail. (rb-site does not
+        # initialize during its site creation process.)
         from reviewboard import initialize
         initialize()
 
-        include_enabled_extensions(settings)
+        if command_name == 'upgrade':
+            # We want to handle this command specially. This function will
+            # perform its own command line executions, so bail after it's
+            # done.
+            upgrade_database()
+            return
 
     execute_from_command_line(sys.argv)
 
@@ -175,10 +264,9 @@ def run():
     except ValueError:
         pass
 
-    if b'DJANGO_SETTINGS_MODULE' not in os.environ:
+    if str('DJANGO_SETTINGS_MODULE') not in os.environ:
         in_subprocess = False
-        os.environ.setdefault(b'DJANGO_SETTINGS_MODULE',
-                              b'reviewboard.settings')
+        os.environ[str('DJANGO_SETTINGS_MODULE')] = str('reviewboard.settings')
     else:
         in_subprocess = True
 
@@ -186,7 +274,7 @@ def run():
         # We're running unit tests, so we need to be sure to mark this in
         # order for the settings to reflect that. Otherwise, the test runner
         # will do things like load extensions or compile static media.
-        os.environ[b'RB_RUNNING_TESTS'] = b'1'
+        os.environ[str('RB_RUNNING_TESTS')] = str('1')
 
     try:
         from reviewboard import settings

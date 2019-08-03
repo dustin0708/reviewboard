@@ -2,6 +2,8 @@
 
 from __future__ import unicode_literals
 
+from django.conf import settings
+
 from djblets.features.checkers import SiteConfigFeatureChecker
 
 
@@ -39,19 +41,27 @@ class RBFeatureChecker(SiteConfigFeatureChecker):
                 Additional keyword arguments.
 
         Keyword Args:
-            request (django.http.HttpRequest):
+            request (django.http.HttpRequest, optional):
                 An optional request. If this request is made against a
                 LocalSite, that LocalSite will be used to look up the feature.
 
                 Either this argument or ``local_site`` must be provided to
                 enable checking against a LocalSite.
 
-            local_site (reviewboard.site.models.LocalSite):
+                If provided, it will be used to cache the results of the
+                :py:class:`~reviewboard.site.models.LocalSite` lookup.
+
+            local_site (reviewboard.site.models.LocalSite, optional):
                 An optional local site. If provided, this LocalSite will be
                 used to look up the status of the requested feature.
 
                 Either this argument or ``request`` must be provided to enable
                 checking against a LocalSite.
+
+            force_check_user_local_sites (bool, optional):
+                Force checking the Local Sites that the user is a member of.
+                This is only used for unit tests, and disables some
+                optimizations intended to stabilize query counts.
 
         Returns:
             bool:
@@ -59,17 +69,32 @@ class RBFeatureChecker(SiteConfigFeatureChecker):
         """
         local_site = kwargs.get('local_site')
         request = kwargs.get('request')
+        force_check_user_local_sites = \
+            kwargs.get('force_check_user_local_sites', False)
 
         local_sites = []
 
         if local_site:
             local_sites.append(local_site)
         elif request is not None:
-            if getattr(request, 'local_site', None):
-                local_sites.append(request.local_site)
+            try:
+                local_sites = request._user_local_sites_cache
+            except AttributeError:
+                if getattr(request, 'local_site', None):
+                    local_sites.append(request.local_site)
 
-            if request.user.is_authenticated():
-                local_sites.extend(request.user.local_site.all())
+                # Note that if we're running unit tests, we don't really want
+                # to bother checking other Local Site associations. They're not
+                # going to come into play unless we're testing this logic
+                # itself, and the generated number of queries becomes too
+                # unpredictable whenever we introduce new features that aren't
+                # enabled by default.
+                if (request.user.is_authenticated() and
+                    (force_check_user_local_sites or
+                     not getattr(settings, 'RUNNING_TEST', False))):
+                    local_sites.extend(request.user.local_site.all())
+
+                request._user_local_sites_cache = local_sites
 
         for local_site in local_sites:
             if (local_site.extra_data and

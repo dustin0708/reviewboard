@@ -14,12 +14,12 @@ from reviewboard.attachments.models import FileAttachment
 from reviewboard.changedescs.models import ChangeDescription
 from reviewboard.diffviewer.models import DiffSet
 from reviewboard.reviews.errors import NotModifiedError, PublishError
+from reviewboard.reviews.fields import get_review_request_fields
 from reviewboard.reviews.models.group import Group
 from reviewboard.reviews.models.base_review_request_details import \
     BaseReviewRequestDetails
 from reviewboard.reviews.models.review_request import ReviewRequest
 from reviewboard.reviews.models.screenshot import Screenshot
-from reviewboard.reviews.fields import get_review_request_fields
 from reviewboard.reviews.signals import review_request_published
 from reviewboard.scmtools.errors import InvalidChangeNumberError
 
@@ -136,17 +136,32 @@ class ReviewRequestDraft(BaseReviewRequestDetails):
         return self.review_request.is_mutable_by(user)
 
     @staticmethod
-    def create(review_request):
-        """Creates a draft based on a review request.
+    def create(review_request, changedesc=None):
+        """Create a draft based on a review request.
 
         This will copy over all the details of the review request that
         we care about. If a draft already exists for the review request,
         the draft will be returned.
+
+        Args:
+            review_request (reviewboard.reviews.models.review_request.
+                            ReviewRequest):
+                The review request to fetch or create the draft from.
+
+            changedesc (reviewboard.changedescs.models.ChangeDescription):
+                A custom change description to set on the draft. This will
+                always be set, overriding any previous one if already set.
+
+        Returns:
+            ReviewRequestDraft:
+            The resulting draft.
         """
         draft, draft_is_new = \
             ReviewRequestDraft.objects.get_or_create(
                 review_request=review_request,
                 defaults={
+                    'changedesc': changedesc,
+                    'extra_data': review_request.extra_data or {},
                     'summary': review_request.summary,
                     'description': review_request.description,
                     'testing_done': review_request.testing_done,
@@ -160,48 +175,82 @@ class ReviewRequestDraft(BaseReviewRequestDetails):
                     'commit_id': review_request.commit_id,
                 })
 
-        if draft.changedesc is None and review_request.public:
-            draft.changedesc = ChangeDescription.objects.create()
+        if (changedesc is None and
+            draft.changedesc_id is None and
+            review_request.public):
+            changedesc = ChangeDescription.objects.create()
+
+        if changedesc is not None and draft.changedesc_id != changedesc.pk:
+            old_changedesc_id = draft.changedesc_id
+            draft.changedesc = changedesc
+            draft.save(update_fields=('changedesc',))
+
+            if old_changedesc_id is not None:
+                ChangeDescription.objects.filter(pk=old_changedesc_id).delete()
+
         if draft_is_new:
-            draft.target_groups = review_request.target_groups.all()
-            draft.target_people = review_request.target_people.all()
-            draft.depends_on = review_request.depends_on.all()
-            draft.extra_data = copy.deepcopy(review_request.extra_data)
-            draft.save()
+            rels_to_update = [
+                ('depends_on', 'to_reviewrequest_id', 'from_reviewrequest_id'),
+                ('target_groups', 'group_id', 'reviewrequest_id'),
+                ('target_people', 'user_id', 'reviewrequest_id'),
+            ]
 
             if review_request.screenshots_count > 0:
                 review_request.screenshots.update(draft_caption=F('caption'))
-                draft.screenshots = review_request.screenshots.all()
+                rels_to_update.append(('screenshots', 'screenshot_id',
+                                       'reviewrequest_id'))
 
             if review_request.inactive_screenshots_count > 0:
                 review_request.inactive_screenshots.update(
                     draft_caption=F('caption'))
-                draft.inactive_screenshots = \
-                    review_request.inactive_screenshots.all()
+                rels_to_update.append(('inactive_screenshots', 'screenshot_id',
+                                       'reviewrequest_id'))
 
             if review_request.file_attachments_count > 0:
                 review_request.file_attachments.update(
                     draft_caption=F('caption'))
-                draft.file_attachments = review_request.file_attachments.all()
+                rels_to_update.append(('file_attachments', 'fileattachment_id',
+                                       'reviewrequest_id'))
 
             if review_request.inactive_file_attachments_count > 0:
                 review_request.inactive_file_attachments.update(
                     draft_caption=F('caption'))
-                draft.inactive_file_attachments = \
-                    review_request.inactive_file_attachments.all()
+                rels_to_update.append(('inactive_file_attachments',
+                                       'fileattachment_id',
+                                       'reviewrequest_id'))
+
+            for rel_field, id_field, lookup_field, in rels_to_update:
+                # We don't need to query the entirety of each object, and
+                # we'd like to avoid any JOINs. So, we'll be using the
+                # M2M 'through' tables to perform lookups of the related
+                # models' IDs.
+                items = list(
+                    getattr(review_request, rel_field).through.objects
+                    .filter(**{lookup_field: review_request.pk})
+                    .values_list(id_field, flat=True)
+                )
+
+                if items:
+                    # Note that we're using add() instead of directly
+                    # assigning the value. This lets us avoid a query that
+                    # Django would perform to determine if it needed to clear
+                    # out any existing values. Since we know this draft is
+                    # new, there's no point in doing that.
+                    getattr(draft, rel_field).add(*items)
 
         return draft
 
     def publish(self, review_request=None, user=None, trivial=False,
-                send_notification=True):
-        """Publishes this draft.
+                send_notification=True, validate_fields=True, timestamp=None):
+        """Publish this draft.
+
+        This is an internal method. Programmatic publishes should use
+        :py:meth:`reviewboard.reviews.models.review_request.ReviewRequest.publish`
+        instead.
 
         This updates and returns the draft's ChangeDescription, which
         contains the changed fields. This is used by the e-mail template
         to tell people what's new and interesting.
-
-        The draft's associated ReviewRequest object will be used if one isn't
-        passed in.
 
         The keys that may be saved in ``fields_changed`` in the
         ChangeDescription are:
@@ -234,10 +283,51 @@ class ReviewRequestDraft(BaseReviewRequestDetails):
         For the ``diff`` field, there is only ever an ``added`` field,
         containing the ID of the new diffset.
 
-        The ``send_notification`` parameter is intended for internal use only,
-        and is there to prevent duplicate notifications when being called by
-        ReviewRequest.publish.
+        Args:
+            review_request (reviewboard.reviews.models.review_request.
+                            ReviewRequest, optional):
+                The review request associated with this diff. If not provided,
+                it will be looked up.
+
+            user (django.contrib.auth.models.User, optional):
+                The user publishing the draft. If not provided, this defaults
+                to the review request submitter.
+
+            trivial (bool, optional):
+                Whether or not this is a trivial publish.
+
+                Trivial publishes do not result in e-mail notifications.
+
+            send_notification (bool, optional):
+                Whether or not this will emit the
+                :py:data:`reviewboard.reviews.signals.review_request_published`
+                signal.
+
+                This parameter is intended for internal use **only**.
+
+            validate_fields (bool, optional):
+                Whether or not the fields should be validated.
+
+                This should only be ``False`` in the case of programmatic
+                publishes, e.g., from close as submitted hooks.
+
+            timestamp (datetime.datetime, optional):
+                The datetime that should be used for all timestamps for objects
+                published
+                (:py:class:`~reviewboard.diffviewer.models.diff_set.DiffSet`,
+                :py:class:`~reviewboard.changedescs.models.ChangeDescription`)
+                over the course of the method.
+
+        Returns:
+            reviewboard.changedescs.models.ChangeDescription:
+            The change description that results from this publish (if any).
+
+            If this is an initial publish, there will be no change description
+            (and this function will return ``None``).
         """
+        if timestamp is None:
+            timestamp = timezone.now()
+
         if not review_request:
             review_request = self.review_request
 
@@ -252,28 +342,44 @@ class ReviewRequestDraft(BaseReviewRequestDetails):
 
         self.copy_fields_to_request(review_request)
 
-        if self.diffset:
-            self.diffset.history = review_request.diffset_history
-            self.diffset.save(update_fields=['history'])
-
         # If no changes were made, raise exception and do not save
         if self.changedesc and not self.changedesc.has_modified_fields():
             raise NotModifiedError()
 
-        if not (self.target_groups.exists() or self.target_people.exists()):
-            raise PublishError(
-                ugettext('There must be at least one reviewer before this '
-                         'review request can be published.'))
+        if validate_fields:
+            if not (self.target_groups.exists() or
+                    self.target_people.exists()):
+                raise PublishError(
+                    ugettext('There must be at least one reviewer before this '
+                             'review request can be published.'))
 
-        if not review_request.summary.strip():
-            raise PublishError(ugettext('The draft must have a summary.'))
+            if not review_request.summary.strip():
+                raise PublishError(
+                    ugettext('The draft must have a summary.'))
 
-        if not review_request.description.strip():
-            raise PublishError(ugettext('The draft must have a description.'))
+            if not review_request.description.strip():
+                raise PublishError(
+                    ugettext('The draft must have a description.'))
+
+            if (review_request.created_with_history and
+                self.diffset and
+                self.diffset.commit_count == 0):
+                raise PublishError(
+                    ugettext('There are no commits attached to the diff.'))
+
+        if self.diffset:
+            if (review_request.created_with_history and not
+                self.diffset.is_commit_series_finalized):
+                raise PublishError(ugettext(
+                    'This commit series is not finalized.'))
+
+            self.diffset.history = review_request.diffset_history
+            self.diffset.timestamp = timestamp
+            self.diffset.save(update_fields=('history', 'timestamp'))
 
         if self.changedesc:
             self.changedesc.user = user
-            self.changedesc.timestamp = timezone.now()
+            self.changedesc.timestamp = timestamp
             self.changedesc.public = True
             self.changedesc.save()
             review_request.changedescs.add(self.changedesc)
@@ -284,7 +390,7 @@ class ReviewRequestDraft(BaseReviewRequestDetails):
         review_request.save()
 
         if send_notification:
-            review_request_published.send(sender=review_request.__class__,
+            review_request_published.send(sender=type(review_request),
                                           user=user,
                                           review_request=review_request,
                                           trivial=trivial,
@@ -307,6 +413,25 @@ class ReviewRequestDraft(BaseReviewRequestDetails):
             commit_id (unicode):
                 The commit ID or changeset ID that the draft will update
                 from.
+
+        Returns:
+            list of unicode:
+            The list of draft fields that have been updated from the commit.
+
+        Raises:
+            reviewboard.hostingsvcs.errors.HostingServiceError:
+                The hosting service backing the repository encountered an
+                error.
+
+            reviewboard.scmtools.errors.InvalidChangeNumberError:
+                The commit ID could not be found in the repository.
+
+            reviewboard.scmtools.errors.SCMError:
+                The repository tool encountered an error.
+
+            NotImplementedError:
+                The repository does not support fetching information from
+                commit IDs.
         """
         scmtool = self.repository.get_scmtool()
         changeset = None
@@ -315,9 +440,9 @@ class ReviewRequestDraft(BaseReviewRequestDetails):
             changeset = scmtool.get_changeset(commit_id, allow_empty=True)
 
         if changeset and changeset.pending:
-            self.update_from_pending_change(commit_id, changeset)
+            return self.update_from_pending_change(commit_id, changeset)
         elif self.repository.supports_post_commit:
-            self.update_from_committed_change(commit_id)
+            return self.update_from_committed_change(commit_id)
         else:
             if changeset:
                 raise InvalidChangeNumberError()
@@ -336,6 +461,10 @@ class ReviewRequestDraft(BaseReviewRequestDetails):
 
             changeset (reviewboard.scmtools.core.ChangeSet):
                 The changeset information to update from.
+
+        Returns:
+            list of unicode:
+            The list of draft fields that have been updated from the change.
         """
         if not changeset:
             raise InvalidChangeNumberError()
@@ -352,15 +481,24 @@ class ReviewRequestDraft(BaseReviewRequestDetails):
         self.description = description
         self.description_rich_text = False
 
+        modified_fields = [
+            'commit_id', 'summary', 'description', 'description_rich_text',
+        ]
+
         if testing_done:
             self.testing_done = testing_done
             self.testing_done_rich_text = False
+            modified_fields += ['testing_done', 'testing_done_rich_text']
 
         if changeset.branch:
             self.branch = changeset.branch
+            modified_fields.append('branch')
 
         if changeset.bugs_closed:
             self.bugs_closed = ','.join(changeset.bugs_closed)
+            modified_fields.append('bugs_closed')
+
+        return modified_fields
 
     def update_from_committed_change(self, commit_id):
         """Update from a committed change present on the server.
@@ -371,6 +509,11 @@ class ReviewRequestDraft(BaseReviewRequestDetails):
         Args:
             commit_id (unicode):
                 The commit ID to update from.
+
+        Returns:
+            list of unicode:
+            The list of draft fields that have been updated from the commit
+            message.
         """
         commit = self.repository.get_change(commit_id)
         summary, message = commit.split_message()
@@ -398,6 +541,14 @@ class ReviewRequestDraft(BaseReviewRequestDetails):
         self.diffset.update_revision_from_history(
             self.review_request.diffset_history)
         self.diffset.save(update_fields=('revision',))
+
+        return [
+            'commit_id',
+            'description',
+            'description_rich_text',
+            'diffset',
+            'summary',
+        ]
 
     def copy_fields_to_request(self, review_request):
         """Copies the draft information to the review request and updates the

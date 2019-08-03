@@ -1,16 +1,16 @@
 from __future__ import unicode_literals
 
-import inspect
 import logging
 import uuid
 import warnings
+from importlib import import_module
 from time import time
 
 from django.contrib.auth.models import User
 from django.core.cache import cache
 from django.core.exceptions import ImproperlyConfigured, ValidationError
-from django.db import models
-from django.db import IntegrityError
+from django.db import IntegrityError, models
+from django.db.models import Q
 from django.utils import six, timezone
 from django.utils.encoding import python_2_unicode_compatible
 from django.utils.functional import cached_property
@@ -42,6 +42,8 @@ class Tool(models.Model):
     # Templates can't access variables on a class properly. It'll attempt to
     # instantiate the class, which will fail without the necessary parameters.
     # So, we use these as convenient wrappers to do what the template can't do.
+    supports_history = property(
+        lambda x: x.scmtool_class.supports_history)
     supports_raw_file_urls = property(
         lambda x: x.scmtool_class.supports_raw_file_urls)
     supports_ticket_auth = property(
@@ -61,8 +63,7 @@ class Tool(models.Model):
             module, attr = path[:i], path[i + 1:]
 
             try:
-                mod = __import__(six.binary_type(module), {}, {},
-                                 [six.binary_type(attr)])
+                mod = import_module(module)
             except ImportError as e:
                 raise ImproperlyConfigured(
                     'Error importing SCM Tool %s: "%s"' % (module, e))
@@ -88,7 +89,7 @@ class Tool(models.Model):
 class Repository(models.Model):
     ENCRYPTED_PASSWORD_PREFIX = '\t'
 
-    name = models.CharField(_('Name'), max_length=64)
+    name = models.CharField(_('Name'), max_length=255)
     path = models.CharField(_('Path'), max_length=255)
     mirror_path = models.CharField(max_length=255, blank=True)
     raw_file_url = models.CharField(
@@ -183,6 +184,9 @@ class Repository(models.Model):
     COMMITS_CACHE_PERIOD_SHORT = 60 * 5  # 5 minutes
     COMMITS_CACHE_PERIOD_LONG = 60 * 60 * 24  # 1 day
 
+    NAME_CONFLICT_ERROR = _('A repository with this name already exists')
+    PATH_CONFLICT_ERROR = _('A repository with this path already exists')
+
     def _set_password(self, value):
         """Sets the password for the repository.
 
@@ -192,7 +196,7 @@ class Repository(models.Model):
         """
         if value:
             value = '%s%s' % (self.ENCRYPTED_PASSWORD_PREFIX,
-                              encrypt_password(value.encode('utf-8')))
+                              encrypt_password(value))
         else:
             value = ''
 
@@ -217,7 +221,7 @@ class Repository(models.Model):
             password = password[len(self.ENCRYPTED_PASSWORD_PREFIX):]
 
             if password:
-                password = decrypt_password(password).decode('utf-8')
+                password = decrypt_password(password)
             else:
                 password = None
         else:
@@ -362,7 +366,7 @@ class Repository(models.Model):
         return self.hooks_uuid
 
     def archive(self, save=True):
-        """Archives a repository.
+        """Archive a repository.
 
         The repository won't appear in any public lists of repositories,
         and won't be used when looking up repositories. Review requests
@@ -370,17 +374,27 @@ class Repository(models.Model):
 
         New repositories can be created with the same information as the
         archived repository.
+
+        Args:
+            save (bool, optional):
+                Whether to save the repository immediately.
         """
         # This should be sufficiently unlikely to create duplicates. time()
         # will use up a max of 8 characters, so we slice the name down to
         # make the result fit in 64 characters
-        self.name = 'ar:%s:%x' % (self.name[:50], int(time()))
+        max_name_len = self._meta.get_field('name').max_length
+        encoded_time = '%x' % int(time())
+        reserved_len = len('ar::') + len(encoded_time)
+
+        self.name = 'ar:%s:%s' % (self.name[:max_name_len - reserved_len],
+                                  encoded_time)
         self.archived = True
         self.public = False
         self.archived_timestamp = timezone.now()
 
         if save:
-            self.save()
+            self.save(update_fields=('name', 'archived', 'public',
+                                     'archived_timestamp'))
 
     def get_file(self, path, revision, base_commit_id=None, request=None):
         """Returns a file from the repository.
@@ -397,6 +411,20 @@ class Repository(models.Model):
         #
         # Basically, this fixes the massive regressions introduced by the
         # Django unicode changes.
+        if not isinstance(path, six.text_type):
+            raise TypeError('"path" must be a Unicode string, not %s'
+                            % type(path))
+
+        if not isinstance(revision, six.text_type):
+            raise TypeError('"revision" must be a Unicode string, not %s'
+                            % type(revision))
+
+        if (base_commit_id is not None and
+            not isinstance(base_commit_id, six.text_type)):
+            raise TypeError('"base_commit_id" must be a Unicode string, '
+                            'not %s'
+                            % type(base_commit_id))
+
         return cache_memoize(
             self._make_file_cache_key(path, revision, base_commit_id),
             lambda: [self._get_file_uncached(path, revision, base_commit_id,
@@ -414,6 +442,20 @@ class Repository(models.Model):
         The result of this call will be cached, making future lookups
         of this path and revision on this repository faster.
         """
+        if not isinstance(path, six.text_type):
+            raise TypeError('"path" must be a Unicode string, not %s'
+                            % type(path))
+
+        if not isinstance(revision, six.text_type):
+            raise TypeError('"revision" must be a Unicode string, not %s'
+                            % type(revision))
+
+        if (base_commit_id is not None and
+            not isinstance(base_commit_id, six.text_type)):
+            raise TypeError('"base_commit_id" must be a Unicode string, '
+                            'not %s'
+                            % type(base_commit_id))
+
         key = self._make_file_exists_cache_key(path, revision, base_commit_id)
 
         if cache.get(make_cache_key(key)) == '1':
@@ -428,10 +470,31 @@ class Repository(models.Model):
         return exists
 
     def get_branches(self):
-        """Returns a list of branches."""
+        """Return a list of all branches on the repository.
+
+        This will fetch a list of all known branches for use in the API and
+        New Review Request page.
+
+        Returns:
+            list of reviewboard.scmtools.core.Branch:
+            The list of branches in the repository. One (and only one) will
+            be marked as the default branch.
+
+        Raises:
+            reviewboard.hostingsvcs.errors.HostingServiceError:
+                The hosting service backing the repository encountered an
+                error.
+
+            reviewboard.scmtools.errors.SCMError:
+                The repository tool encountered an error.
+
+            NotImplementedError:
+                Branch retrieval is not available for this type of repository.
+        """
         hosting_service = self.hosting_service
 
         cache_key = make_cache_key('repository-branches:%s' % self.pk)
+
         if hosting_service:
             branches_callable = lambda: hosting_service.get_branches(self)
         else:
@@ -444,10 +507,44 @@ class Repository(models.Model):
         return 'repository-commit:%s:%s' % (self.pk, commit)
 
     def get_commits(self, branch=None, start=None):
-        """Returns a list of commits.
+        """Return a list of commits.
 
-        This is paginated via the 'start' parameter. Any exceptions are
-        expected to be handled by the caller.
+        This will fetch a batch of commits from the repository for use in the
+        API and New Review Request page.
+
+        The resulting commits will be in order from newest to oldest, and
+        should return upwards of a fixed number of commits (usually 30, but
+        this depends on the type of repository and its limitations). It may
+        also be limited to commits that exist on a given branch (if supported
+        by the repository).
+
+        This can be called multiple times in succession using the
+        :py:attr:`Commit.parent` of the last entry as the ``start`` parameter
+        in order to paginate through the history of commits in the repository.
+
+        Args:
+            branch (unicode, optional):
+                The branch to limit commits to. This may not be supported by
+                all repositories.
+
+            start (unicode, optional):
+                The commit to start at. If not provided, this will fetch the
+                first commit in the repository.
+
+        Returns:
+            list of reviewboard.scmtools.core.Commit:
+            The retrieved commits.
+
+        Raises:
+            reviewboard.hostingsvcs.errors.HostingServiceError:
+                The hosting service backing the repository encountered an
+                error.
+
+            reviewboard.scmtools.errors.SCMError:
+                The repository tool encountered an error.
+
+            NotImplementedError:
+                Commits retrieval is not available for this type of repository.
         """
         hosting_service = self.hosting_service
 
@@ -485,9 +582,26 @@ class Repository(models.Model):
         return commits
 
     def get_change(self, revision):
-        """Get an individual change.
+        """Return an individual change/commit in the repository.
 
-        This returns a tuple of (commit message, diff).
+        Args:
+            revision (unicode):
+                The commit ID or revision to retrieve.
+
+        Returns:
+            reviewboard.scmtools.core.Commit:
+            The commit from the repository.
+
+        Raises:
+            reviewboard.hostingsvcs.errors.HostingServiceError:
+                The hosting service backing the repository encountered an
+                error.
+
+            reviewboard.scmtools.errors.SCMError:
+                The repository tool encountered an error.
+
+            NotImplementedError:
+                Commits retrieval is not available for this type of repository.
         """
         hosting_service = self.hosting_service
 
@@ -495,6 +609,42 @@ class Repository(models.Model):
             return hosting_service.get_change(self, revision)
         else:
             return self.get_scmtool().get_change(revision)
+
+    def normalize_patch(self, patch, filename, revision):
+        """Normalize a diff/patch file before it's applied.
+
+        This can be used to take an uploaded diff file and modify it so that
+        it can be properly applied. This may, for instance, uncollapse
+        keywords or remove metadata that would confuse :command:`patch`.
+
+        This passes the request on to the hosting service or repository
+        tool backend.
+
+        Args:
+            patch (bytes):
+                The diff/patch file to normalize.
+
+            filename (unicode):
+                The name of the file being changed in the diff.
+
+            revision (unicode):
+                The revision of the file being changed in the diff.
+
+        Returns:
+            bytes:
+            The resulting diff/patch file.
+        """
+        hosting_service = self.hosting_service
+
+        if hosting_service:
+            return hosting_service.normalize_patch(repository=self,
+                                                   patch=patch,
+                                                   filename=filename,
+                                                   revision=revision)
+        else:
+            return self.get_scmtool().normalize_patch(patch=patch,
+                                                      filename=filename,
+                                                      revision=revision)
 
     def is_accessible_by(self, user):
         """Returns whether or not the user has access to the repository.
@@ -509,8 +659,8 @@ class Repository(models.Model):
         return (self.public or
                 user.is_superuser or
                 (user.is_authenticated() and
-                 (self.review_groups.filter(users__pk=user.pk).count() > 0 or
-                  self.users.filter(pk=user.pk).count() > 0)))
+                 (self.review_groups.filter(users__pk=user.pk).exists() or
+                  self.users.filter(pk=user.pk).exists())))
 
     def is_mutable_by(self, user):
         """Returns whether or not the user can modify or delete the repository.
@@ -583,18 +733,18 @@ class Repository(models.Model):
                 path,
                 revision,
                 base_commit_id=base_commit_id)
+
+            assert isinstance(data, bytes), (
+                '%s.get_file() must return a byte string, not %s'
+                % (type(hosting_service).__name__, type(data)))
         else:
             tool = self.get_scmtool()
-            argspec = inspect.getargspec(tool.get_file)
+            data = tool.get_file(path, revision,
+                                 base_commit_id=base_commit_id)
 
-            if argspec.keywords is None:
-                warnings.warn('SCMTool.get_file() must take keyword '
-                              'arguments, signature for %s is deprecated.'
-                              % tool.name, DeprecationWarning)
-                data = tool.get_file(path, revision)
-            else:
-                data = tool.get_file(path, revision,
-                                     base_commit_id=base_commit_id)
+            assert isinstance(data, bytes), (
+                '%s.get_file() must return a byte string, not %s'
+                % (type(tool).__name__, type(data)))
 
         log_timer.done()
 
@@ -642,16 +792,8 @@ class Repository(models.Model):
                     base_commit_id=base_commit_id)
             else:
                 tool = self.get_scmtool()
-                argspec = inspect.getargspec(tool.file_exists)
-
-                if argspec.keywords is None:
-                    warnings.warn('SCMTool.file_exists() must take keyword '
-                                  'arguments, signature for %s is deprecated.'
-                                  % tool.name, DeprecationWarning)
-                    exists = tool.file_exists(path, revision)
-                else:
-                    exists = tool.file_exists(path, revision,
-                                              base_commit_id=base_commit_id)
+                exists = tool.file_exists(path, revision,
+                                          base_commit_id=base_commit_id)
 
             checked_file_exists.send(sender=self,
                                      path=path,
@@ -679,21 +821,41 @@ class Repository(models.Model):
         aren't checked properly if one of the relations is null. This means
         that users who aren't using local sites could create multiple groups
         with the same name.
+
+        Raises:
+            django.core.exceptions.ValidationError:
+                Validation of the model's data failed. Details are in the
+                exception.
         """
         super(Repository, self).clean()
 
         if self.local_site is None:
-            q = Repository.objects.exclude(pk=self.pk)
+            existing_repos = (
+                Repository.objects
+                .exclude(pk=self.pk)
+                .filter(Q(name=self.name) |
+                        (Q(archived=False) &
+                         Q(path=self.path)))
+                .values('name', 'path')
+            )
 
-            if q.filter(name=self.name).exists():
-                raise ValidationError(
-                    _('A repository with this name already exists'),
-                    params={'field': 'name'})
+            errors = {}
 
-            if q.filter(path=self.path).exists():
-                raise ValidationError(
-                    _('A repository with this path already exists'),
-                    params={'field': 'path'})
+            for repo_info in existing_repos:
+                if repo_info['name'] == self.name:
+                    errors['name'] = [
+                        ValidationError(self.NAME_CONFLICT_ERROR,
+                                        code='repository_name_exists'),
+                    ]
+
+                if repo_info['path'] == self.path:
+                    errors['path'] = [
+                        ValidationError(self.PATH_CONFLICT_ERROR,
+                                        code='repository_path_exists'),
+                    ]
+
+            if errors:
+                raise ValidationError(errors)
 
     class Meta:
         db_table = 'scmtools_repository'

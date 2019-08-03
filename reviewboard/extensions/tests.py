@@ -1,12 +1,9 @@
 from __future__ import unicode_literals
 
-from contextlib import contextmanager
-
 from django.contrib.auth.models import User
 from django.core import mail
 from django.template import Context, Template
 from django.test.client import RequestFactory
-from django.utils import six
 from djblets.avatars.tests import DummyAvatarService
 from djblets.extensions.extension import ExtensionInfo
 from djblets.extensions.manager import ExtensionManager
@@ -14,11 +11,9 @@ from djblets.extensions.models import RegisteredExtension
 from djblets.features.testing import override_feature_check
 from djblets.mail.utils import build_email_address_for_user
 from djblets.registries.errors import AlreadyRegisteredError, RegistrationError
-from djblets.siteconfig.models import SiteConfiguration
 from kgb import SpyAgency
 from mock import Mock
 
-from reviewboard.admin.siteconfig import load_site_config
 from reviewboard.admin.widgets import (primary_widgets,
                                        secondary_widgets,
                                        Widget)
@@ -64,35 +59,6 @@ from reviewboard.webapi.base import ExtraDataAccessLevel, WebAPIResource
 from reviewboard.webapi.tests.base import BaseWebAPITestCase
 from reviewboard.webapi.tests.mimetypes import root_item_mimetype
 from reviewboard.webapi.tests.urls import get_root_url
-
-
-@contextmanager
-def set_siteconfig_settings(settings):
-    """A context manager to toggle site configuration settings.
-
-    Args:
-        settings (dict):
-            The new site configuration settings.
-    """
-    siteconfig = SiteConfiguration.objects.get_current()
-
-    old_settings = {}
-
-    for setting, value in six.iteritems(settings):
-        old_settings[setting] = siteconfig.get(setting)
-        siteconfig.set(setting, value)
-
-    siteconfig.save()
-    load_site_config()
-
-    try:
-        yield
-    finally:
-        for setting, value in six.iteritems(old_settings):
-            siteconfig.set(setting, value)
-
-        siteconfig.save()
-        load_site_config()
 
 
 class ExtensionManagerMixin(object):
@@ -594,41 +560,6 @@ class NavigationBarHookTests(TestCase):
 
         self.assertEqual(t.render(context).strip(), '')
 
-    def test_navigation_bar_hooks_with_is_enabled_for_legacy(self):
-        """Testing NavigationBarHook.is_enabled_for and legacy argument
-        format
-        """
-        def is_enabled_for(user):
-            self.assertEqual(user, request.user)
-
-            return True
-
-        entry = {
-            'label': 'Test Nav Entry',
-            'url': 'foo-url',
-        }
-
-        hook = NavigationBarHook(extension=self.extension, entries=[entry],
-                                 is_enabled_for=is_enabled_for)
-
-        request = self.client.request()
-        request.user = User(username='text')
-
-        context = Context({
-            'request': request,
-            'local_site_name': 'test-site',
-        })
-        entries = hook.get_entries(context)
-        self.assertEqual(len(entries), 1)
-        self.assertEqual(entries[0], entry)
-
-        t = Template(
-            '{% load rb_extensions %}'
-            '{% navigation_bar_hooks %}')
-
-        self.assertEqual(t.render(context).strip(),
-                         '<li><a href="%(url)s">%(label)s</a></li>' % entry)
-
     def test_navigation_bar_hooks_with_url_name(self):
         "Testing navigation entry extension hooks with url names"""
         entry = {
@@ -662,7 +593,8 @@ class NavigationBarHookTests(TestCase):
 
 
 class TestService(HostingService):
-    name = 'test-service'
+    hosting_service_id = 'test-service'
+    name = 'Test Service'
 
     def get_file(self, repository, path, revision, *args, **kwargs):
         """Return the specified file from the repository.
@@ -734,6 +666,7 @@ class TestService(HostingService):
 
 class HostingServiceHookTests(ExtensionManagerMixin, TestCase):
     """Testing HostingServiceHook."""
+
     def setUp(self):
         super(HostingServiceHookTests, self).setUp()
 
@@ -746,18 +679,28 @@ class HostingServiceHookTests(ExtensionManagerMixin, TestCase):
 
     def test_register(self):
         """Testing HostingServiceHook initializing"""
-        HostingServiceHook(extension=self.extension, service_cls=TestService)
+        HostingServiceHook(self.extension, TestService)
 
-        self.assertNotEqual(None, get_hosting_service(TestService.name))
+        self.assertEqual(get_hosting_service('test-service'),
+                         TestService)
+
+    def test_register_without_hosting_service_id(self):
+        """Testing HostingServiceHook initializing without hosting_service_id
+        """
+        class TestServiceWithoutID(TestService):
+            hosting_service_id = None
+
+        message = 'TestServiceWithoutID.hosting_service_id must be set.'
+
+        with self.assertRaisesMessage(ValueError, message):
+            HostingServiceHook(self.extension, TestServiceWithoutID)
 
     def test_unregister(self):
         """Testing HostingServiceHook uninitializing"""
-        hook = HostingServiceHook(extension=self.extension,
-                                  service_cls=TestService)
-
+        hook = HostingServiceHook(self.extension, TestService)
         hook.disable_hook()
 
-        self.assertEqual(None, get_hosting_service(TestService.name))
+        self.assertIsNone(get_hosting_service('test-service'))
 
 
 class TestWidget(Widget):
@@ -1603,7 +1546,7 @@ class EmailHookTests(ExtensionManagerMixin, SpyAgency, TestCase):
             'review_request': review_request,
         }
 
-        with set_siteconfig_settings({'mail_send_review_mail': True}):
+        with self.siteconfig_settings({'mail_send_review_mail': True}):
             review_request.publish(admin)
 
         self.assertEqual(len(mail.outbox), 1)
@@ -1641,7 +1584,7 @@ class EmailHookTests(ExtensionManagerMixin, SpyAgency, TestCase):
             'to_owner_only': False,
         }
 
-        with set_siteconfig_settings({'mail_send_review_mail': True}):
+        with self.siteconfig_settings({'mail_send_review_mail': True}):
             review.publish(admin)
 
         self.assertEqual(len(mail.outbox), 1)
@@ -1680,7 +1623,7 @@ class EmailHookTests(ExtensionManagerMixin, SpyAgency, TestCase):
             'reply': reply,
         }
 
-        with set_siteconfig_settings({'mail_send_review_mail': True}):
+        with self.siteconfig_settings({'mail_send_review_mail': True}):
             reply.publish(admin)
 
         self.assertEqual(len(mail.outbox), 1)
@@ -1714,7 +1657,7 @@ class EmailHookTests(ExtensionManagerMixin, SpyAgency, TestCase):
             'close_type': ReviewRequest.SUBMITTED,
         }
 
-        with set_siteconfig_settings({'mail_send_review_close_mail': True}):
+        with self.siteconfig_settings({'mail_send_review_close_mail': True}):
             review_request.close(ReviewRequest.SUBMITTED, admin)
 
         self.assertEqual(len(mail.outbox), 1)
@@ -1748,7 +1691,7 @@ class EmailHookTests(ExtensionManagerMixin, SpyAgency, TestCase):
             'close_type': ReviewRequest.DISCARDED,
         }
 
-        with set_siteconfig_settings({'mail_send_review_close_mail': True}):
+        with self.siteconfig_settings({'mail_send_review_close_mail': True}):
             review_request.close(ReviewRequest.DISCARDED, admin)
 
         self.assertEqual(len(mail.outbox), 1)
@@ -1781,7 +1724,7 @@ class EmailHookTests(ExtensionManagerMixin, SpyAgency, TestCase):
             'mail_send_review_close_mail': True,
         }
 
-        with set_siteconfig_settings(siteconfig_settings):
+        with self.siteconfig_settings(siteconfig_settings):
             self.assertEqual(len(mail.outbox), 0)
 
             review.publish()

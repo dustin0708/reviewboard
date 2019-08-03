@@ -8,24 +8,28 @@ from datetime import datetime
 from itertools import chain
 
 from django.db.models import Q
-from django.template.loader import render_to_string
 from django.utils import six
 from django.utils.timezone import utc
 from django.utils.translation import ugettext as _
 from djblets.registries.registry import (ALREADY_REGISTERED,
                                          ATTRIBUTE_REGISTERED,
                                          NOT_REGISTERED)
+from djblets.util.compat.django.template.context import flatten_context
+from djblets.util.compat.django.template.loader import render_to_string
 from djblets.util.dates import get_latest_timestamp
 from djblets.util.decorators import cached_property
 
+from reviewboard.diffviewer.models import DiffCommit
 from reviewboard.registries.registry import OrderedRegistry
-from reviewboard.reviews.builtin_fields import ReviewRequestPageDataMixin
+from reviewboard.reviews.builtin_fields import (CommitListField,
+                                                ReviewRequestPageDataMixin)
 from reviewboard.reviews.features import status_updates_feature
 from reviewboard.reviews.fields import get_review_request_fieldsets
 from reviewboard.reviews.models import (BaseComment,
                                         Comment,
                                         FileAttachmentComment,
                                         GeneralComment,
+                                        Review,
                                         ReviewRequest,
                                         ScreenshotComment,
                                         StatusUpdate)
@@ -83,12 +87,12 @@ class ReviewRequestPageData(object):
         changedescs (list of reviewboard.changedescs.models.ChangeDescription):
             All the change descriptions to be shown on the page.
 
-        diffsets (list of reviewboard.diffviewer.models.DiffSet):
+        diffsets (list of reviewboard.diffviewer.models.diffset.DiffSet):
             All of the diffsets associated with the review request.
 
         diffsets_by_id (dict):
             A mapping from ID to
-            :py:class:`~reviewboard.diffviewer.models.DiffSet`.
+            :py:class:`~reviewboard.diffviewer.models.diffset.DiffSet`.
 
         draft (reviewboard.reviews.models.ReviewRequestDraft):
             The active draft of the review request, if any. May be ``None``.
@@ -205,6 +209,7 @@ class ReviewRequestPageData(object):
         self.reviews = []
         self.changedescs = []
         self.diffsets = []
+        self.commits_by_diffset_id = {}
         self.diffsets_by_id = {}
         self.all_status_updates = []
         self.latest_review_timestamp = None
@@ -421,13 +426,25 @@ class ReviewRequestPageData(object):
         if self.reviews:
             review_ids = self.reviews_by_id.keys()
 
-            for model, key, ordering in (
-                (GeneralComment, 'general_comments', None),
-                (ScreenshotComment, 'screenshot_comments', None),
-                (FileAttachmentComment, 'file_attachment_comments', None),
-                (Comment, 'diff_comments', ('comment__filediff',
-                                            'comment__first_line',
-                                            'comment__timestamp'))):
+            for model, review_field_name, key, ordering in (
+                (GeneralComment,
+                 'general_comments',
+                 'general_comments',
+                 None),
+                (ScreenshotComment,
+                 'screenshot_comments',
+                 'screenshot_comments',
+                 None),
+                (FileAttachmentComment,
+                 'file_attachment_comments',
+                 'file_attachment_comments',
+                 None),
+                (Comment,
+                 'comments',
+                 'diff_comments',
+                 ('comment__filediff',
+                  'comment__first_line',
+                  'comment__timestamp'))):
                 # Due to mistakes in how we initially made the schema, we have
                 # a ManyToManyField in between comments and reviews, instead of
                 # comments having a ForeignKey to the review. This makes it
@@ -436,7 +453,7 @@ class ReviewRequestPageData(object):
                 # The solution to this is to not query the comment objects, but
                 # rather the through table. This will let us grab the review
                 # and comment in one go, using select_related.
-                related_field = model.review.related.field
+                related_field = Review._meta.get_field(review_field_name)
                 comment_field_name = related_field.m2m_reverse_field_name()
                 through = related_field.rel.through
                 q = (
@@ -524,6 +541,14 @@ class ReviewRequestPageData(object):
                         self.issue_counts[status_key] += 1
                         self.issue_counts['total'] += 1
                         self.issues.append(comment)
+
+        if self.review_request.created_with_history:
+            pks = [diffset.pk for diffset in self.diffsets]
+
+            if self.draft and self.draft.diffset_id is not None:
+                pks.append(self.draft.diffset_id)
+
+            self.commits_by_diffset_id = DiffCommit.objects.by_diffset_ids(pks)
 
     def get_entries(self):
         """Return all entries for the review request page.
@@ -928,8 +953,10 @@ class BaseReviewRequestPageEntry(object):
         user = request.user
         last_visited = context.get('last_visited')
 
+        new_context = flatten_context(context)
+
         try:
-            new_context = {
+            new_context.update({
                 'entry': self,
                 'entry_is_new': (
                     user.is_authenticated() and
@@ -939,7 +966,7 @@ class BaseReviewRequestPageEntry(object):
                 'show_entry_statuses_area': (
                     self.entry_pos !=
                     BaseReviewRequestPageEntry.ENTRY_POS_INITIAL),
-            }
+            })
             new_context.update(self.get_extra_context(request, context))
         except Exception as e:
             logging.exception('Error generating template context for %s '
@@ -948,16 +975,13 @@ class BaseReviewRequestPageEntry(object):
             return ''
 
         try:
-            # Note that update() implies push().
-            context.update(new_context)
-
-            return render_to_string(self.template_name, context)
+            return render_to_string(template_name=self.template_name,
+                                    context=new_context,
+                                    request=request)
         except Exception as e:
             logging.exception('Error rendering template for %s (ID=%s): %s',
                               self.__class__.__name__, self.entry_id, e)
             return ''
-        finally:
-            context.pop()
 
     def finalize(self):
         """Perform final computations after all comments have been added."""
@@ -1193,8 +1217,8 @@ class StatusUpdatesEntryMixin(DiffCommentsSerializerMixin, ReviewEntryMixin):
             description = update.description
 
         update.summary_html = render_to_string(
-            'reviews/status_update_summary.html',
-            {
+            template_name='reviews/status_update_summary.html',
+            context={
                 'description': description,
                 'header_class': update.header_class,
                 'summary': update.summary,
@@ -1826,6 +1850,34 @@ class ChangeEntry(StatusUpdatesEntryMixin, BaseReviewRequestPageEntry):
             (not status_updates or
              self.are_status_updates_collapsed(status_updates))
         )
+
+    def get_js_model_data(self):
+        """Return data to pass to the JavaScript Model during instantiation.
+
+        This will serialize commit information if present for the
+        :js:class:`RB.DiffCommitListView`.
+
+        Returns:
+            dict:
+            A dictionary of model data.
+        """
+        model_data = super(ChangeEntry, self).get_js_model_data()
+
+        commit_info = self.changedesc.fields_changed.get(
+            CommitListField.field_id)
+
+        if commit_info:
+            commits = self.data.commits_by_diffset_id
+
+            old_commits = commits[commit_info['old']]
+            new_commits = commits[commit_info['new']]
+
+            model_data['commits'] = [
+                commit.serialize()
+                for commit in chain(old_commits, new_commits)
+            ]
+
+        return model_data
 
 
 class ReviewRequestPageEntryRegistry(OrderedRegistry):

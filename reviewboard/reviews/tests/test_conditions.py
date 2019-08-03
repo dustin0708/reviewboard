@@ -3,6 +3,7 @@ from __future__ import unicode_literals
 import re
 
 from django.contrib.auth.models import User
+from django.test.client import RequestFactory
 from djblets.conditions import ConditionSet, Condition
 
 from reviewboard.reviews.conditions import (AnyReviewGroupsPublicOperator,
@@ -13,7 +14,9 @@ from reviewboard.reviews.conditions import (AnyReviewGroupsPublicOperator,
                                             ReviewRequestRepositoriesChoice,
                                             ReviewRequestRepositoryTypeChoice,
                                             ReviewRequestReviewGroupsChoice,
-                                            ReviewRequestOwnerChoice)
+                                            ReviewRequestOwnerChoice,
+                                            ReviewRequestReviewerChoice,
+                                            ReviewRequestParticipantChoice)
 from reviewboard.reviews.models import Group
 from reviewboard.site.models import LocalSite
 from reviewboard.testing import TestCase
@@ -79,12 +82,20 @@ class ReviewGroupsChoiceTests(TestCase):
     def setUp(self):
         super(ReviewGroupsChoiceTests, self).setUp()
 
-        self.choice = ReviewGroupsChoice()
+        self.request = RequestFactory().request()
+        self.request.user = User.objects.create(username='test-user')
+
+        self.choice = ReviewGroupsChoice(request=self.request)
 
     def test_get_queryset(self):
         """Testing ReviewGroupsChoice.get_queryset"""
+        # These should match.
         group1 = self.create_review_group(name='group1')
         group2 = self.create_review_group(name='group2')
+
+        # These should not match.
+        self.create_review_group(name='group3',
+                                 visible=False)
 
         self.assertQuerysetEqual(
             self.choice.get_queryset(),
@@ -105,12 +116,75 @@ class ReviewGroupsChoiceTests(TestCase):
         # These should not match.
         self.create_review_group(name='group3')
         self.create_review_group(name='group4', local_site=bad_site)
+        self.create_review_group(name='group5',
+                                 local_site=good_site,
+                                 visible=False)
 
         self.choice.extra_state['local_site'] = good_site
 
         self.assertQuerysetEqual(
             self.choice.get_queryset(),
             [group1.pk, group2.pk],
+            transform=lambda group: group.pk)
+
+    def test_get_queryset_with_matching(self):
+        """Testing ReviewGroupsChoice.get_queryset with matching=True"""
+        local_site = LocalSite.objects.create(name='site1')
+
+        # These should match.
+        group1 = self.create_review_group(name='group1')
+        group2 = self.create_review_group(name='group2')
+        group3 = self.create_review_group(name='group3',
+                                          visible=False)
+        group4 = self.create_review_group(name='group4',
+                                          invite_only=True)
+
+        # These should not match.
+        self.create_review_group(name='group5',
+                                 visible=False,
+                                 local_site=local_site)
+
+        self.choice.extra_state.update({
+            'local_site': None,
+            'matching': True,
+        })
+
+        self.assertQuerysetEqual(
+            self.choice.get_queryset(),
+            [group1.pk, group2.pk, group3.pk, group4.pk],
+            transform=lambda group: group.pk)
+
+    def test_get_queryset_with_matching_and_local_site(self):
+        """Testing ReviewGroupsChoice.get_queryset with matching=True and
+        LocalSite
+        """
+        good_site = LocalSite.objects.create(name='good-site')
+        bad_site = LocalSite.objects.create(name='bad-site')
+
+        # These should match.
+        group1 = self.create_review_group(name='group1',
+                                          local_site=good_site)
+        group2 = self.create_review_group(name='group2',
+                                          local_site=good_site)
+        group3 = self.create_review_group(name='group3',
+                                          local_site=good_site,
+                                          visible=False)
+        group4 = self.create_review_group(name='group4',
+                                          local_site=good_site,
+                                          invite_only=True)
+
+        # These should not match.
+        self.create_review_group(name='group5')
+        self.create_review_group(name='group6', local_site=bad_site)
+
+        self.choice.extra_state.update({
+            'local_site': good_site,
+            'matching': True,
+        })
+
+        self.assertQuerysetEqual(
+            self.choice.get_queryset(),
+            [group1.pk, group2.pk, group3.pk, group4.pk],
             transform=lambda group: group.pk)
 
     def test_matches_with_any_op(self):
@@ -724,7 +798,10 @@ class ReviewRequestReviewGroupsChoiceTests(TestCase):
     def setUp(self):
         super(ReviewRequestReviewGroupsChoiceTests, self).setUp()
 
-        self.choice = ReviewRequestReviewGroupsChoice()
+        self.request = RequestFactory().request()
+        self.request.user = User.objects.create(username='test-user')
+
+        self.choice = ReviewRequestReviewGroupsChoice(request=self.request)
 
     def test_get_queryset(self):
         """Testing ReviewGroupsChoice.get_queryset"""
@@ -946,3 +1023,153 @@ class ReviewRequestOwnerChoiceTests(TestCase):
             review_request=self.create_review_request(submitter=self.user2)))
         self.assertTrue(condition_set.matches(
             review_request=self.create_review_request(submitter=self.user3)))
+
+
+class ReviewRequestReviewerChoiceTests(TestCase):
+    """Unit tests for ReviewRequestReviewerChoice."""
+
+    fixtures = ['test_users']
+
+    def setUp(self):
+        super(ReviewRequestReviewerChoiceTests, self).setUp()
+
+        self.choice = ReviewRequestReviewerChoice()
+        self.user1 = User.objects.get(username='doc')
+        self.user2 = User.objects.get(username='grumpy')
+        self.user3 = User.objects.get(username='dopey')
+
+    def test_get_queryset(self):
+        """Testing ReviewRequestReviewerChoice.get_queryset"""
+        self.assertQuerysetEqual(
+            self.choice.get_queryset(),
+            User.objects.values_list('pk', flat=True),
+            transform=lambda user: user.pk)
+
+    def test_get_queryset_with_local_site(self):
+        """Testing ReviewRequestReviewerChoice.get_queryset with LocalSite"""
+        good_site = LocalSite.objects.create(name='good-site')
+        good_site.users.add(self.user2)
+
+        bad_site = LocalSite.objects.create(name='bad-site')
+        bad_site.users.add(self.user3)
+
+        self.choice.extra_state['local_site'] = good_site
+
+        self.assertQuerysetEqual(
+            self.choice.get_queryset(),
+            [self.user2.pk],
+            transform=lambda user: user.pk)
+
+    def test_matches_with_contains_any_op(self):
+        """Testing ReviewRequestReviewerChoice.matches with
+        "contains-any" operator
+        """
+        condition_set = ConditionSet(ConditionSet.MODE_ALL, [
+            Condition(self.choice,
+                      self.choice.get_operator('contains-any'),
+                      [self.user1, self.user2]),
+        ])
+
+        review_request = self.create_review_request(target_people=[self.user1])
+        self.assertTrue(condition_set.matches(review_request=review_request))
+
+        review_request = self.create_review_request(target_people=[self.user2])
+        self.assertTrue(condition_set.matches(review_request=review_request))
+
+        review_request = self.create_review_request(target_people=[self.user3])
+        self.assertFalse(condition_set.matches(review_request=review_request))
+
+    def test_matches_with_does_not_contain_any_op(self):
+        """Testing ReviewRequestReviewerChoice.matches with
+        "does-not-contain-any" operator
+        """
+        condition_set = ConditionSet(ConditionSet.MODE_ALL, [
+            Condition(self.choice,
+                      self.choice.get_operator('does-not-contain-any'),
+                      [self.user1, self.user2]),
+        ])
+
+        review_request = self.create_review_request(target_people=[self.user1])
+        self.assertFalse(condition_set.matches(review_request=review_request))
+
+        review_request = self.create_review_request(target_people=[self.user2])
+        self.assertFalse(condition_set.matches(review_request=review_request))
+
+        review_request = self.create_review_request(target_people=[self.user3])
+        self.assertTrue(condition_set.matches(review_request=review_request))
+
+
+class ReviewRequestParticipantChoiceTests(TestCase):
+    """Unit tests for ReviewRequestParticipantChoice."""
+
+    fixtures = ['test_users']
+
+    def setUp(self):
+        super(ReviewRequestParticipantChoiceTests, self).setUp()
+
+        self.choice = ReviewRequestParticipantChoice()
+        self.user1 = User.objects.get(username='doc')
+        self.user2 = User.objects.get(username='grumpy')
+        self.user3 = User.objects.get(username='dopey')
+
+    def test_get_queryset(self):
+        """Testing ReviewRequestParticipantChoice.get_queryset"""
+        self.assertQuerysetEqual(
+            self.choice.get_queryset(),
+            User.objects.values_list('pk', flat=True),
+            transform=lambda user: user.pk)
+
+    def test_get_queryset_with_local_site(self):
+        """Testing ReviewRequestParticipantChoice.get_queryset with
+        LocalSite
+        """
+        good_site = LocalSite.objects.create(name='good-site')
+        good_site.users.add(self.user2)
+
+        bad_site = LocalSite.objects.create(name='bad-site')
+        bad_site.users.add(self.user3)
+
+        self.choice.extra_state['local_site'] = good_site
+
+        self.assertQuerysetEqual(
+            self.choice.get_queryset(),
+            [self.user2.pk],
+            transform=lambda user: user.pk)
+
+    def test_matches_with_contains_any_op(self):
+        """Testing ReviewRequestParticipantChoice.matches with "contains-any"
+        operator
+        """
+        condition_set = ConditionSet(ConditionSet.MODE_ALL, [
+            Condition(self.choice,
+                      self.choice.get_operator('contains-any'),
+                      [self.user1, self.user2]),
+        ])
+
+        review_request = self.create_review_request()
+        self.assertFalse(condition_set.matches(review_request=review_request))
+
+        review_request = self.create_review_request()
+        self.create_review(review_request,
+                           user=self.user1,
+                           public=True)
+        self.assertTrue(condition_set.matches(review_request=review_request))
+
+    def test_matches_with_does_not_contain_any_op(self):
+        """Testing ReviewRequestParticipantChoice.matches with
+        "does-not-contain-any" operator
+        """
+        condition_set = ConditionSet(ConditionSet.MODE_ALL, [
+            Condition(self.choice,
+                      self.choice.get_operator('does-not-contain-any'),
+                      [self.user1, self.user2]),
+        ])
+
+        review_request = self.create_review_request()
+        self.assertTrue(condition_set.matches(review_request=review_request))
+
+        review_request = self.create_review_request()
+        self.create_review(review_request,
+                           user=self.user1,
+                           public=True)
+        self.assertFalse(condition_set.matches(review_request=review_request))

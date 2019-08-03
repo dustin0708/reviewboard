@@ -2,8 +2,10 @@ from __future__ import unicode_literals
 
 import os
 
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.utils import six
 from djblets.webapi.errors import INVALID_FORM_DATA
+from djblets.webapi.testing.decorators import webapi_test_template
 
 from reviewboard import scmtools
 from reviewboard.attachments.models import FileAttachment
@@ -74,6 +76,61 @@ class ResourceListTests(BaseWebAPITestCase):
         self.api_get(
             get_draft_filediff_list_url(diffset, review_request),
             expected_status=403)
+
+    @webapi_test_template
+    def test_commit_filter(self):
+        """Testing the GET <URL>?commit-id= API filters draft FileDiffs to the
+        requested commit
+        """
+        repository = self.create_repository()
+        review_request = self.create_review_request(repository=repository,
+                                                    submitter=self.user)
+        diffset = self.create_diffset(review_request=review_request,
+                                      draft=True,
+                                      repository=repository)
+        commit = self.create_diffcommit(diffset=diffset,
+                                        repository=repository)
+
+        rsp = self.api_get(
+            '%s?commit-id=%s'
+            % (get_draft_filediff_list_url(diffset, review_request),
+               commit.commit_id),
+            expected_status=200,
+            expected_mimetype=filediff_list_mimetype)
+
+        self.assertIn('stat', rsp)
+        self.assertEqual(rsp['stat'], 'ok')
+        self.assertIn('files', rsp)
+        self.assertEqual(rsp['total_results'], 1)
+
+        item_rsp = rsp['files'][0]
+        filediff = FileDiff.objects.get(pk=item_rsp['id'])
+        self.compare_item(item_rsp, filediff)
+
+    @webapi_test_template
+    def test_commit_filter_no_results(self):
+        """Testing the GET <URL>?commit-id= API with no results"""
+        repository = self.create_repository()
+        review_request = self.create_review_request(repository=repository,
+                                                    submitter=self.user)
+        diffset = self.create_diffset(review_request=review_request,
+                                      draft=True,
+                                      repository=repository)
+        commit = self.create_diffcommit(diffset=diffset,
+                                        repository=repository)
+
+        rsp = self.api_get(
+            '%s?commit-id=%s'
+            % (get_draft_filediff_list_url(diffset, review_request),
+               commit.parent_id),
+            expected_status=200,
+            expected_mimetype=filediff_list_mimetype)
+
+        self.assertIn('stat', rsp)
+        self.assertEqual(rsp['stat'], 'ok')
+        self.assertIn('files', rsp)
+        self.assertEqual(rsp['files'], [])
+        self.assertEqual(rsp['total_results'], 0)
 
 
 @six.add_metaclass(BasicTestsMetaclass)
@@ -163,7 +220,7 @@ class ResourceItemTests(ExtraDataItemMixin, BaseWebAPITestCase):
         diff_filename = os.path.join(os.path.dirname(scmtools.__file__),
                                      'testdata', 'git_binary_image_new.diff')
 
-        with open(diff_filename, 'r') as f:
+        with open(diff_filename, 'rb') as f:
             rsp = self.api_post(
                 get_diff_list_url(review_request),
                 {
@@ -181,7 +238,7 @@ class ResourceItemTests(ExtraDataItemMixin, BaseWebAPITestCase):
         filediff = filediffs[0]
         self.assertEqual(filediff.source_file, 'logo.png')
 
-        with open(self.get_sample_image_filename(), 'r') as f:
+        with open(self.get_sample_image_filename(), 'rb') as f:
             rsp = self.api_put(
                 get_draft_filediff_item_url(filediff, review_request) +
                 '?expand=dest_attachment',
@@ -210,18 +267,16 @@ class ResourceItemTests(ExtraDataItemMixin, BaseWebAPITestCase):
         review_request = self.create_review_request(create_repository=True,
                                                     submitter=self.user)
 
-        diff_filename = os.path.join(os.path.dirname(scmtools.__file__),
-                                     'testdata',
-                                     'git_binary_image_modified.diff')
-
-        with open(diff_filename, 'r') as f:
-            rsp = self.api_post(
-                get_diff_list_url(review_request),
-                {
-                    'path': f,
-                    'base_commit_id': '1234',
-                },
-                expected_mimetype=diff_item_mimetype)
+        diff = SimpleUploadedFile('git_binary_image_modified.diff',
+                                  self.DEFAULT_GIT_BINARY_IMAGE_DIFF,
+                                  content_type='text/x-patch')
+        rsp = self.api_post(
+            get_diff_list_url(review_request),
+            {
+                'path': diff,
+                'base_commit_id': '1234',
+            },
+            expected_mimetype=diff_item_mimetype)
 
         self.assertEqual(rsp['stat'], 'ok')
 
@@ -232,7 +287,7 @@ class ResourceItemTests(ExtraDataItemMixin, BaseWebAPITestCase):
         filediff = filediffs[0]
         self.assertEqual(filediff.source_file, 'logo.png')
 
-        with open(self.get_sample_image_filename(), 'r') as f:
+        with open(self.get_sample_image_filename(), 'rb') as f:
             rsp = self.api_put(
                 get_draft_filediff_item_url(filediff, review_request) +
                 '?expand=dest_attachment',
@@ -261,18 +316,17 @@ class ResourceItemTests(ExtraDataItemMixin, BaseWebAPITestCase):
         review_request = self.create_review_request(create_repository=True,
                                                     submitter=self.user)
 
-        diff_filename = os.path.join(os.path.dirname(scmtools.__file__),
-                                     'testdata',
-                                     'git_binary_image_modified.diff')
+        diff = SimpleUploadedFile('git_binary_image_modified.diff',
+                                  self.DEFAULT_GIT_BINARY_IMAGE_DIFF,
+                                  content_type='text/x-patch')
 
-        with open(diff_filename, 'r') as f:
-            rsp = self.api_post(
-                get_diff_list_url(review_request),
-                {
-                    'path': f,
-                    'base_commit_id': '1234',
-                },
-                expected_mimetype=diff_item_mimetype)
+        rsp = self.api_post(
+            get_diff_list_url(review_request),
+            {
+                'path': diff,
+                'base_commit_id': '1234',
+            },
+            expected_mimetype=diff_item_mimetype)
 
         diffset = DiffSet.objects.get(pk=rsp['diff']['id'])
         filediff = diffset.files.all()[0]
@@ -280,7 +334,7 @@ class ResourceItemTests(ExtraDataItemMixin, BaseWebAPITestCase):
         url = get_draft_filediff_item_url(filediff, review_request)
         trophy_filename = self.get_sample_image_filename()
 
-        with open(trophy_filename, 'r') as f:
+        with open(trophy_filename, 'rb') as f:
             self.api_put(
                 url,
                 {
@@ -288,7 +342,7 @@ class ResourceItemTests(ExtraDataItemMixin, BaseWebAPITestCase):
                 },
                 expected_mimetype=filediff_item_mimetype)
 
-        with open(trophy_filename, 'r') as f:
+        with open(trophy_filename, 'rb') as f:
             rsp = self.api_put(
                 url,
                 {

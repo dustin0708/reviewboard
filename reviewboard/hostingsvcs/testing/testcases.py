@@ -3,13 +3,18 @@
 from __future__ import unicode_literals
 
 import io
+import json
 from contextlib import contextmanager
 
+from django.utils import six
 from django.utils.six.moves.urllib.error import HTTPError
+from django.utils.six.moves.urllib.parse import urlparse
 from kgb import SpyAgency
 
 from reviewboard.hostingsvcs.models import HostingServiceAccount
-from reviewboard.hostingsvcs.service import get_hosting_service
+from reviewboard.hostingsvcs.service import (HostingServiceClient,
+                                             HostingServiceHTTPResponse,
+                                             get_hosting_service)
 from reviewboard.testing import TestCase
 
 
@@ -53,6 +58,9 @@ class HttpTestContext(object):
         self.hosting_account = hosting_account
         self.service = hosting_account.service
         self.client = self.service.client
+
+        self.http_requests = []
+        self.http_credentials = []
 
         self._test_case = test_case
         self._http_request_func = http_request_func
@@ -117,14 +125,61 @@ class HttpTestContext(object):
             **kwargs (dict):
                 Additional parameters to check in the call.
         """
-        kwargs.setdefault('username', self._test_case.default_username)
-        kwargs.setdefault('password', self._test_case.default_password)
+        failureException = self._test_case.failureException
 
-        self._test_case.assertTrue(self.http_calls[index].called_with(
-            method=method,
-            body=body,
-            headers=headers,
-            **kwargs))
+        # Check arguments against the request.
+        request = self.http_requests[index]
+
+        if 'url' in kwargs:
+            url = kwargs.pop('url')
+
+            if request.url != url:
+                raise failureException('HTTP call %s: URL: %r != %r'
+                                       % (index, request.url, url))
+
+        if request.method != method:
+            raise failureException('HTTP call %s: method: %r != %r'
+                                   % (index, request.method, method))
+
+        if request.body != body:
+            raise failureException('HTTP call %s: body: %r != %r'
+                                   % (index, request.body, body))
+
+        # Check arguments against the generated credentials.
+        if 'username' in kwargs and 'password' in kwargs:
+            # This is a simplification for checking standard username/password
+            # credentials, and maintains backwards-compatibility.
+            username = kwargs.pop('username')
+            password = kwargs.pop('password')
+
+            if username is None and password is None:
+                credentials = {}
+            else:
+                credentials = {
+                    'username': username,
+                    'password': password,
+                }
+        else:
+            credentials = kwargs.pop('credentials',
+                                     self._test_case.default_http_credentials)
+
+        if self.http_credentials[index] != credentials:
+            raise failureException('HTTP call %s: credentials: %r != %r'
+                                   % (index, self.http_credentials[index],
+                                      credentials))
+
+        # Check arguments against the call.
+        call = self.http_calls[index]
+
+        if call.kwargs['headers'] != headers:
+            raise failureException('HTTP call %s: headers: %r != %r'
+                                   % (index, call.kwargs['headers'], body))
+
+        for key, value in six.iteritems(kwargs):
+            if call.kwargs[key] != value:
+                raise failureException('HTTP call %s: %s: %r != %r'
+                                       % (index, key, call.kwargs[key], value))
+
 
 
 class HostingServiceTestCase(SpyAgency, TestCase):
@@ -159,6 +214,14 @@ class HostingServiceTestCase(SpyAgency, TestCase):
 
     fixtures = ['test_scmtools']
 
+    @property
+    def default_http_credentials(self):
+        """The default credentials sent in HTTP requests."""
+        return {
+            'username': self.default_username,
+            'password': self.default_password,
+        }
+
     @classmethod
     def setUpClass(cls):
         super(HostingServiceTestCase, cls).setUpClass()
@@ -175,7 +238,7 @@ class HostingServiceTestCase(SpyAgency, TestCase):
 
     @contextmanager
     def setup_http_test(self, http_request_func=None, payload=None,
-                        status_code=None, hosting_account=None,
+                        headers=None, status_code=None, hosting_account=None,
                         expected_http_calls=None):
         """Set up state for HTTP-related tests.
 
@@ -201,6 +264,9 @@ class HostingServiceTestCase(SpyAgency, TestCase):
 
             payload (bytes, optional):
                 An explicit payload to return to the client.
+
+            headers (dict, optional):
+                Headers to send along with the result.
 
             status_code (int, optional):
                 An explicit HTTP status code. Only values >= 400 are used.
@@ -234,32 +300,167 @@ class HostingServiceTestCase(SpyAgency, TestCase):
                     'http_request_func and status_code cannot both be '
                     'provided')
         else:
-            if payload is None:
-                payload = b''
-            elif not isinstance(payload, bytes):
-                raise TypeError('payload must be a byte string or None')
-
-            def http_request_func(client, url, *args, **kwargs):
-                if status_code is not None and status_code >= 400:
-                    raise HTTPError(url, status_code, '', {},
-                                    io.BytesIO(payload))
-
-                return payload, {}
+            http_request_func = self.make_handler_for_paths({
+                None: {
+                    'status_code': status_code,
+                    'payload': payload,
+                    'headers': headers,
+                },
+            })
 
         client = hosting_account.service.client
+        client_cls = type(client)
 
-        if hasattr(client.http_request, 'unspy'):
-            # Reset for this next test. This allows the test case to use
-            # this context function multiple times.
-            client.http_request.unspy()
+        # Reset for this next test. This allows the test case to use
+        # this context function multiple times.
+        for func in (client_cls.build_http_request,
+                     client_cls.get_http_credentials,
+                     client_cls.http_request,
+                     client_cls.open_http_request):
+            if hasattr(func, 'unspy'):
+                func.unspy()
 
-        self.spy_on(client.http_request, call_fake=http_request_func)
+        self.spy_on(client_cls.http_request,
+                    owner=client_cls)
+        self.spy_on(client_cls.open_http_request,
+                    owner=client_cls,
+                    call_fake=http_request_func)
 
-        ctx = HttpTestContext(self, hosting_account, client.http_request)
+        ctx = HttpTestContext(
+            test_case=self,
+            hosting_account=hosting_account,
+            http_request_func=client_cls.http_request)
+
+        def _build_http_request(client, *args, **kwargs):
+            result = client.build_http_request.call_original(client, *args,
+                                                             **kwargs)
+            ctx.http_requests.append(result)
+
+            return result
+
+        def _get_http_credentials(client, *args, **kwargs):
+            result = client.get_http_credentials.call_original(client, *args,
+                                                               **kwargs)
+            ctx.http_credentials.append(result)
+
+            return result
+
+        self.spy_on(client_cls.build_http_request,
+                    owner=client_cls,
+                    call_fake=_build_http_request)
+        self.spy_on(client_cls.get_http_credentials,
+                    owner=client_cls,
+                    call_fake=_get_http_credentials)
+
         yield ctx
 
         if expected_http_calls is not None:
             self.assertEqual(len(ctx.http_calls), expected_http_calls)
+
+    def make_handler_for_paths(self, paths):
+        """Return an HTTP handler function for serving the supplied paths.
+
+        This is meant to be passed to :py:meth:`setup_http_test`.
+
+        This takes a dictionary matching paths to information to return. Each
+        key is a path relative to the domain, which may optionally contain a
+        full query string to match. It may also be ``None``, which is the
+        fallback.
+
+        Each value is a dictionary containing optional ``payload``,
+        ``status_code``, or ``headers`` values.
+
+        Args:
+            paths (dict):
+                The dictionary of paths.
+
+        Returns:
+            callable:
+            The resulting HTTP handler function.
+
+        Example:
+            .. code-block:: python
+
+               handler = make_handler_for_paths({
+                   '/api/1/diffs/': {
+                       'payload': b'...',
+                       'headers': {
+                           b'My-Header': b'value',
+                        },
+                   },
+                   '/api/1/bad/': {
+                       'status_code': 404,
+                       'payload': b'Not found.',
+                   },
+                   None: {
+                       'payload': b'fallback data...',
+                   },
+               })
+        """
+        # Validate the paths to make sure payloads are in the right format.
+        for path, path_info in six.iteritems(paths):
+            payload = path_info.get('payload')
+
+            if payload is not None and not isinstance(payload, bytes):
+                raise TypeError('payload must be a byte string or None')
+
+        def _handler(client, request):
+            url = request.url
+            parts = urlparse(url)
+
+            full_path = '%s?%s' % (parts.path, parts.query)
+            path_info = paths.get(full_path)
+
+            if path_info is None:
+                path_info = paths.get(parts.path)
+
+                if path_info is None:
+                    path_info = paths.get(None)
+
+                    if path_info is None:
+                        self.fail('Unexpected path "%s"' % full_path)
+
+            status_code = path_info.get('status_code') or 200
+            payload = path_info.get('payload') or b''
+            headers = path_info.get('headers') or {}
+
+            if status_code >= 400:
+                raise HTTPError(url, status_code, '', headers,
+                                io.BytesIO(payload))
+            else:
+                return HostingServiceHTTPResponse(
+                    request=request,
+                    url=url,
+                    data=payload,
+                    headers=headers,
+                    status_code=status_code)
+
+        return _handler
+
+    def dump_json(self, data, for_response=True):
+        """Dump JSON-compatible data to the proper string type.
+
+        If ``for_response`` is ``True`` (the default), the resulting string
+        will be a byte string. Otherwise, it will be a Unicode string.
+
+        Args:
+            data (object):
+                The data to dump.
+
+            for_response (bool, optional):
+                Whether the resulting string is intended for a response
+                payload.
+
+        Returns:
+            unicode or bytes:
+            The serialized string.
+        """
+        result = json.dumps(data)
+
+        if for_response and isinstance(result, six.text_type):
+            result = result.encode('utf-8')
+
+        return result
 
     def get_form(self, plan=None, fields={}):
         """Return the configuration form for the hosting service.

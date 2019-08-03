@@ -113,7 +113,7 @@ RB.LinkifyUtils = {
     linkifyBugs(text, bugTrackerURL) {
         if (bugTrackerURL) {
             return text.replace(
-                /\b(bug|issue) (#([^.,\s]+)|#?(\d+))/gi,
+                /\b(bug|issue) (#([^.,)\]\s]+)|#?(\d+))/gi,
                 function(text, m2, m3, bugnum1, bugnum2) {
                     /*
                      * The bug number can appear in either of those groups,
@@ -184,7 +184,9 @@ RB.LinkifyUtils = {
      *         by the captured bug ID.
      */
     linkifyChildren(el, bugTrackerURL) {
-        for (let node = el.childNodes[0]; node; node = node.nextSibling) {
+        for (let i = 0; i < el.childNodes.length; i++) {
+            const node = el.childNodes[i];
+
             if (node.nodeType === node.TEXT_NODE) {
                 if (node.textContent) {
                     const newText = RB.LinkifyUtils.linkifyText(

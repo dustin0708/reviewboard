@@ -6,12 +6,12 @@ import warnings
 from django import template
 from django.template import TemplateSyntaxError
 from django.template.defaultfilters import escapejs, stringfilter
-from django.template.loader import render_to_string
 from django.utils import six
 from django.utils.html import format_html
 from django.utils.safestring import mark_safe
 from django.utils.translation import ugettext_lazy as _
 from djblets.siteconfig.models import SiteConfiguration
+from djblets.util.compat.django.template.loader import render_to_string
 from djblets.util.decorators import blocktag
 from djblets.util.humanize import humanize_list
 from djblets.util.templatetags.djblets_js import json_dumps_items
@@ -38,8 +38,8 @@ from reviewboard.site.urlresolvers import local_site_reverse
 register = template.Library()
 
 
-@register.simple_tag(takes_context=False)
-def display_review_request_trophies(review_request):
+@register.simple_tag(takes_context=True)
+def display_review_request_trophies(context, review_request):
     """Returns the HTML for the trophies awarded to a review request."""
     trophy_models = Trophy.objects.get_trophies(review_request)
 
@@ -54,19 +54,26 @@ def display_review_request_trophies(review_request):
         if trophy_type_cls is not UnknownTrophy:
             try:
                 trophy_type = trophy_type_cls()
+                text = trophy_type.format_display_text(context['request'],
+                                                       trophy_model)
+
                 trophies.append({
                     'image_urls': trophy_type.image_urls,
                     'image_width': trophy_type.image_width,
                     'image_height': trophy_type.image_height,
                     'name': trophy_type.name,
-                    'text': trophy_type.get_display_text(trophy_model),
+                    'text': text,
                 })
             except Exception as e:
                 logging.error('Error when rendering trophy %r (%r): %s',
                               trophy_model.pk, trophy_type_cls, e,
                               exc_info=1)
 
-    return render_to_string('reviews/trophy_box.html', {'trophies': trophies})
+    return render_to_string(
+        template_name='reviews/trophy_box.html',
+        context={
+            'trophies': trophies,
+        })
 
 
 def _generate_reply_html(context, user, context_id, review, reply, timestamp,
@@ -137,7 +144,9 @@ def _generate_reply_html(context, user, context_id, review, reply, timestamp,
     }, **extra_context))
 
     try:
-        return render_to_string('reviews/review_reply.html', context)
+        return render_to_string(
+            template_name='reviews/review_reply.html',
+            context=context)
     finally:
         context.pop()
 
@@ -355,7 +364,7 @@ def review_request_actions(context):
             logging.exception('Error rendering top-level action %s',
                               top_level_action.action_id)
 
-    return ''.join(content)
+    return mark_safe(''.join(content))
 
 
 @register.simple_tag(takes_context=True)
@@ -378,7 +387,7 @@ def child_actions(context):
             logging.exception('Error rendering child action %s',
                               child_action.action_id)
 
-    return ''.join(content)
+    return mark_safe(''.join(content))
 
 
 @register.tag
@@ -404,29 +413,13 @@ def for_review_request_field(context, nodelist, review_request_details,
                               field_cls, e)
             continue
 
-        if hasattr(field_cls.should_render, '__call__'):
-            warnings.warn('Field %r uses an old style should_render function '
-                          'which is deprecated and will be removed in the '
-                          'future. This should be converted to a property.'
-                          % field_cls,
-                          DeprecationWarning)
-            try:
-                should_render = field.should_render(field.value)
-            except Exception as e:
-                logging.exception(
-                    'Error running should_render for field %r: %s',
-                    field_cls, e)
-                should_render = True
-        else:
-            should_render = field.should_render
-
-        if should_render:
+        if field.should_render:
             context.push()
             context['field'] = field
             s.append(nodelist.render(context))
             context.pop()
 
-    return ''.join(s)
+    return mark_safe(''.join(s))
 
 
 @register.tag
@@ -487,7 +480,7 @@ def for_review_request_fieldset(context, nodelist, review_request_details):
             logging.error('Error running is_empty for ReviewRequestFieldset '
                           '%r: %s', fieldset_cls, e, exc_info=1)
 
-    return ''.join(s)
+    return mark_safe(''.join(s))
 
 
 @register.tag
@@ -624,9 +617,9 @@ def render_star(user, obj):
 
     if not hasattr(obj, 'starred'):
         try:
-            profile = user.get_profile()
+            profile = user.get_profile(create_if_missing=False)
         except Profile.DoesNotExist:
-            return ""
+            return ''
 
     if isinstance(obj, ReviewRequest):
         obj_info = {
@@ -638,7 +631,7 @@ def render_star(user, obj):
             starred = obj.starred
         else:
             starred = \
-                profile.starred_review_requests.filter(pk=obj.id).count() > 0
+                profile.starred_review_requests.filter(pk=obj.id).exists()
     elif isinstance(obj, Group):
         obj_info = {
             'type': 'groups',
@@ -648,8 +641,7 @@ def render_star(user, obj):
         if hasattr(obj, 'starred'):
             starred = obj.starred
         else:
-            starred = \
-                profile.starred_groups.filter(pk=obj.id).count() > 0
+            starred = profile.starred_groups.filter(pk=obj.id).exists()
     else:
         raise template.TemplateSyntaxError(
             "star tag received an incompatible object type (%s)" %
@@ -660,12 +652,14 @@ def render_star(user, obj):
     else:
         image_alt = _("Click to star")
 
-    return render_to_string('reviews/star.html', {
-        'object': obj_info,
-        'starred': int(starred),
-        'alt': image_alt,
-        'user': user,
-    })
+    return render_to_string(
+        template_name='reviews/star.html',
+        context={
+            'object': obj_info,
+            'starred': int(starred),
+            'alt': image_alt,
+            'user': user,
+        })
 
 
 @register.inclusion_tag('reviews/comment_issue.html',
@@ -744,13 +738,15 @@ def expand_fragment_link(context, expanding, tooltip,
     expand_pos = (lines_of_context[0] + expand_above,
                   lines_of_context[1] + expand_below)
 
-    return render_to_string('reviews/expand_link.html', {
-        'tooltip': tooltip,
-        'text': text,
-        'comment_id': context['comment'].id,
-        'expand_pos': expand_pos,
-        'image_class': image_class,
-    })
+    return render_to_string(
+        template_name='reviews/expand_link.html',
+        context={
+            'tooltip': tooltip,
+            'text': text,
+            'comment_id': context['comment'].id,
+            'expand_pos': expand_pos,
+            'image_class': image_class,
+        })
 
 
 @register.simple_tag(takes_context=True)
@@ -762,14 +758,16 @@ def expand_fragment_header_link(context, header):
     lines_of_context = context['lines_of_context']
     offset = context['first_line'] - header['line']
 
-    return render_to_string('reviews/expand_link.html', {
-        'tooltip': _('Expand to header'),
-        'text': format_html('<code>{0}</code>', header['text']),
-        'comment_id': context['comment'].id,
-        'expand_pos': (lines_of_context[0] + offset,
-                       lines_of_context[1]),
-        'image_class': 'rb-icon-diff-expand-header',
-    })
+    return render_to_string(
+        template_name='reviews/expand_link.html',
+        context={
+            'tooltip': _('Expand to header'),
+            'text': format_html('<code>{0}</code>', header['text']),
+            'comment_id': context['comment'].id,
+            'expand_pos': (lines_of_context[0] + offset,
+                           lines_of_context[1]),
+            'image_class': 'rb-icon-diff-expand-header',
+        })
 
 
 @register.simple_tag(name='normalize_text_for_edit', takes_context=True)
@@ -998,11 +996,24 @@ def reviewable_page_model_data(context):
         'closeDescriptionRenderedText': _render_markdown(
             close_description,
             close_description_rich_text),
+        'commits': None,
         'hasDraft': draft is not None,
         'mutableByUser': context['mutable_by_user'],
         'showSendEmail': context['send_email'],
         'statusMutableByUser': context['status_mutable_by_user'],
     }
+
+    if review_request.created_with_history:
+        diffset = review_request_details.get_latest_diffset()
+
+        if diffset is None:
+            diffset = review_request.get_latest_diffset()
+
+        if diffset is not None:
+            editor_data['commits'] = [
+                commit.serialize()
+                for commit in diffset.commits.all()
+            ]
 
     # Build extra data for the RB.ReviewRequest.
     extra_review_request_draft_data = {}
@@ -1118,7 +1129,7 @@ def render_review_request_entries(context, entries):
     """
     request = context['request']
 
-    return ''.join(
+    return mark_safe(''.join(
         entry.render_to_string(request, context)
         for entry in entries
-    )
+    ))

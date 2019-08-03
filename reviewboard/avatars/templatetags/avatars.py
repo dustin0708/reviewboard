@@ -41,6 +41,14 @@ def avatar(context, user, size, service_id=None):
         The user's avatar rendered to HTML, or an empty string if no avatar
         service could be found.
     """
+    if not isinstance(size, int):
+        try:
+            size = int(size)
+        except ValueError:
+            logging.exception('Invalid size pased to avatar template tag: %r',
+                              size)
+            return mark_safe('')
+
     service = avatar_services.for_user(user, service_id)
 
     if service is None:
@@ -135,4 +143,4 @@ def avatar_urls(context, user, size, service_id=None):
             )
         }
 
-    return mark_safe(json.dumps(urls))
+    return mark_safe(json.dumps(urls, sort_keys=True))

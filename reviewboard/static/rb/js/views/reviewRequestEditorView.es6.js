@@ -422,6 +422,8 @@ RB.ReviewRequestEditorView = Backbone.View.extend({
         'click #unarchive-review-request-link': '_onUnarchiveClicked',
         'click #mute-review-request-link': '_onMuteClicked',
         'click #unmute-review-request-link': '_onUnmuteClicked',
+        'click #toggle-unarchived': '_onUnarchiveClicked',
+        'click #toggle-archived': '_onArchiveClicked',
     },
 
     _archiveActionsTemplate: _.template(dedent`
@@ -742,7 +744,7 @@ RB.ReviewRequestEditorView = Backbone.View.extend({
 
         RB.ReviewRequestActionHook.each(hook => {
             _.each(hook.get('callbacks'),
-                   (selector, handler) => this.$(selector).click(handler));
+                   (handler, selector) => this.$(selector).click(handler));
         });
     },
 
@@ -1112,7 +1114,7 @@ RB.ReviewRequestEditorView = Backbone.View.extend({
         e.preventDefault();
 
         const uploadDialog = new RB.UploadAttachmentView({
-            reviewRequest: this.model.get('reviewRequest'),
+            reviewRequestEditor: this.model,
         });
         uploadDialog.render();
     },
@@ -1222,11 +1224,22 @@ RB.ReviewRequestEditorView = Backbone.View.extend({
             unmuteText: gettext('Unmute'),
         }));
 
-        const iconClass = (visibility === RB.ReviewRequest.VISIBILITY_VISIBLE
-                           ? 'rb-icon-archive-off' : 'rb-icon-archive-on');
+        const visible = (visibility === RB.ReviewRequest.VISIBILITY_VISIBLE);
+
+        const iconClass = (visible
+                           ? 'rb-icon-archive-off'
+                           : 'rb-icon-archive-on');
+
+        const iconTitle = (visible
+                           ? gettext('Archive review request')
+                           : gettext('Unarchive review request'));
+
+        const iconId = (visible
+                        ? 'toggle-archived'
+                        : 'toggle-unarchived');
 
         this.$('#hide-review-request-link')
-            .html(`<span class="rb-icon ${iconClass}"></span>`);
+            .html(`<span class="rb-icon ${iconClass}" id="${iconId}" title="${iconTitle}"></span>`);
 
         if (RB.UserSession.instance.get('readOnly')) {
             this.$('#hide-review-request-menu').hide();

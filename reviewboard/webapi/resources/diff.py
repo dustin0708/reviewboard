@@ -20,6 +20,7 @@ from djblets.webapi.fields import (DateTimeFieldType,
                                    StringFieldType)
 
 from reviewboard.diffviewer.errors import DiffTooBigError, EmptyDiffError
+from reviewboard.diffviewer.features import dvcs_feature
 from reviewboard.diffviewer.models import DiffSet
 from reviewboard.reviews.forms import UploadDiffForm
 from reviewboard.reviews.models import ReviewRequest, ReviewRequestDraft
@@ -90,8 +91,15 @@ class DiffResource(WebAPIResource):
                            'diff was uploaded.',
             'added_in': '1.7.13',
         },
+        'commit_count': {
+            'type': IntFieldType,
+            'description': 'The number of commits present in the case of '
+                           'review requests created with commit history.',
+            'added_in': '4.0',
+        },
     }
     item_child_resources = [
+        resources.diffcommit,
         resources.filediff,
     ]
 
@@ -178,7 +186,7 @@ class DiffResource(WebAPIResource):
             return DOES_NOT_EXIST
 
         tool = review_request.repository.get_scmtool()
-        data = tool.get_parser('').raw_diff(diffset)
+        data = tool.get_parser(b'').raw_diff(diffset)
 
         resp = HttpResponse(data, content_type='text/x-patch')
 
@@ -199,13 +207,11 @@ class DiffResource(WebAPIResource):
                             REPO_FILE_NOT_FOUND, INVALID_FORM_DATA,
                             INVALID_ATTRIBUTE, DIFF_EMPTY, DIFF_TOO_BIG)
     @webapi_request_fields(
-        required={
+        optional={
             'path': {
                 'type': FileFieldType,
                 'description': 'The main diff to upload.',
             },
-        },
-        optional={
             'basedir': {
                 'type': StringFieldType,
                 'description': 'The base directory that will prepended to '
@@ -231,7 +237,8 @@ class DiffResource(WebAPIResource):
         },
         allow_unknown=True
     )
-    def create(self, request, extra_fields={}, *args, **kwargs):
+    def create(self, request, extra_fields={}, local_site=None, *args,
+               **kwargs):
         """Creates a new diff by parsing an uploaded diff file.
 
         This will implicitly create the new Review Request draft, which can
@@ -283,45 +290,65 @@ class DiffResource(WebAPIResource):
         if review_request.repository is None:
             return INVALID_ATTRIBUTE, {
                 'reason': 'This review request was created as attachments-'
-                          'only, with no repository.'
+                          'only, with no repository.',
             }
+        elif review_request.created_with_history:
+            assert dvcs_feature.is_enabled(request=request)
 
-        form_data = request.POST.copy()
-        form = UploadDiffForm(review_request,
-                              data=form_data,
-                              files=request.FILES,
+            if 'path' in request.FILES:
+                return INVALID_FORM_DATA, {
+                    'reason': (
+                        'This review request was created with support for '
+                        'multiple commits.\n'
+                        '\n'
+                        'Create an empty diff revision and upload commits to '
+                        'that instead.'
+                    ),
+                }
+
+            diffset = DiffSet.objects.create_empty(
+                repository=review_request.repository,
+                base_commit_id=request.POST.get('base_commit_id'))
+            diffset.update_revision_from_history(
+                review_request.diffset_history)
+            diffset.save(update_fields=('revision',))
+        else:
+            form_data = request.POST.copy()
+            form = UploadDiffForm(review_request,
+                                  data=form_data,
+                                  files=request.FILES,
+                                  request=request)
+
+            if not form.is_valid():
+                return INVALID_FORM_DATA, {
+                    'fields': self._get_form_errors(form),
+                }
+
+            try:
+                diffset = form.create()
+            except FileNotFoundError as e:
+                return REPO_FILE_NOT_FOUND, {
+                    'file': e.path,
+                    'revision': six.text_type(e.revision)
+                }
+            except EmptyDiffError as e:
+                return DIFF_EMPTY
+            except DiffTooBigError as e:
+                return DIFF_TOO_BIG, {
+                    'reason': six.text_type(e),
+                    'max_size': e.max_diff_size,
+                }
+            except Exception as e:
+                # This could be very wrong, but at least they'll see the error.
+                # We probably want a new error type for this.
+                logging.error("Error uploading new diff: %s", e, exc_info=1,
                               request=request)
 
-        if not form.is_valid():
-            return INVALID_FORM_DATA, {
-                'fields': self._get_form_errors(form),
-            }
-
-        try:
-            diffset = form.create()
-        except FileNotFoundError as e:
-            return REPO_FILE_NOT_FOUND, {
-                'file': e.path,
-                'revision': six.text_type(e.revision)
-            }
-        except EmptyDiffError as e:
-            return DIFF_EMPTY
-        except DiffTooBigError as e:
-            return DIFF_TOO_BIG, {
-                'reason': six.text_type(e),
-                'max_size': e.max_diff_size,
-            }
-        except Exception as e:
-            # This could be very wrong, but at least they'll see the error.
-            # We probably want a new error type for this.
-            logging.error("Error uploading new diff: %s", e, exc_info=1,
-                          request=request)
-
-            return INVALID_FORM_DATA, {
-                'fields': {
-                    'path': [six.text_type(e)]
+                return INVALID_FORM_DATA, {
+                    'fields': {
+                        'path': [six.text_type(e)]
+                    }
                 }
-            }
 
         discarded_diffset = None
 
@@ -340,7 +367,7 @@ class DiffResource(WebAPIResource):
         draft.diffset = diffset
 
         # We only want to add default reviewers the first time.  Was bug 318.
-        if review_request.diffset_history.diffsets.count() == 0:
+        if review_request.can_add_default_reviewers():
             draft.add_default_reviewers()
 
         draft.save()
@@ -366,9 +393,7 @@ class DiffResource(WebAPIResource):
     @webapi_login_required
     @webapi_check_local_site
     @webapi_response_errors(DOES_NOT_EXIST, NOT_LOGGED_IN, PERMISSION_DENIED)
-    @webapi_request_fields(
-        allow_unknown=True
-    )
+    @webapi_request_fields(allow_unknown=True)
     def update(self, request, extra_fields={}, *args, **kwargs):
         """Updates a diff.
 
@@ -400,6 +425,76 @@ class DiffResource(WebAPIResource):
         return 200, {
             self.item_result_key: diffset,
         }
+
+    def get_links(self, child_resources=[], obj=None, request=None,
+                  *args, **kwargs):
+        """Return the links for the resource.
+
+        If the DVCS feature is disabled, links to resources that require the
+        feature will not be included.
+
+        Args:
+            child_resource (list of reviewboard.webapi.base.WebAPIResource):
+                The list of child resources for which links are to be
+                serialized.
+
+            obj (reviewboard.diffviewer.models.diffset.DiffSet, optional):
+                The object whose links are being serialized.
+
+            request (django.http.HttpRequest, optional):
+                The HTTP request from the client.
+
+            *args (tuple):
+                Additional positional arguments.
+
+            **kwargs (dict):
+                Additional keyword arguments.
+
+        Returns:
+            dict:
+            A dictionary of serialized links for the resource.
+        """
+        if (obj is not None and
+            not dvcs_feature.is_enabled(request=request) and
+            resources.diffcommit in child_resources):
+            child_resources = list(child_resources)
+            child_resources.remove(resources.diffcommit)
+
+        return super(DiffResource, self).get_links(
+            child_resources, obj=obj, request=request, *args, **kwargs)
+
+    def serialize_object(self, obj, request=None, *args, **kwargs):
+        """Serialize a DiffSet.
+
+        This method excludes fields from features that are not enabled.
+
+        Args:
+            obj (reviewboard.diffviewer.models.diffset.DiffSet):
+                The DiffSet to serialize.
+
+            request (django.http.HttpRequest, optional):
+                The HTTP request from the client.
+
+            *args (tuple):
+                Additional positional arguments.
+
+            **kwargs (dict):
+                Additional keyword arguments.
+
+        Returns:
+            dict:
+            The serialized DiffSet.
+        """
+        result = super(DiffResource, self).serialize_object(
+            obj, request=request, *args, **kwargs)
+
+        if not dvcs_feature.is_enabled(request=request):
+            # The field may not have been serialized (e.g., if `only-fields`
+            # was set to a subset of fields that excludes
+            # `created_with_history`).
+            result.pop('commit_count', None)
+
+        return result
 
 
 diff_resource = DiffResource()

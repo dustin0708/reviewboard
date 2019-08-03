@@ -4,6 +4,7 @@ import os
 
 import paramiko
 from django.utils import six
+from django.utils.encoding import force_str
 
 from reviewboard.ssh.client import SSHClient
 from reviewboard.ssh.errors import (BadHostKeyError, SSHAuthenticationError,
@@ -30,8 +31,37 @@ uses_netloc.extend(ssh_uri_schemes)
 
 
 def humanize_key(key):
-    """Returns a human-readable key as a series of hex characters."""
-    return ':'.join(["%02x" % ord(c) for c in key.get_fingerprint()])
+    """Return a human-readable key as a series of hex characters.
+
+    Each byte of the key will be converted into a 2-byte hex representation
+    in the form of ``XX:XX:XX:XX...``.
+
+    Args:
+        key (paramiko.PKey):
+            The key to humanize.
+
+    Returns:
+        unicode:
+        The human-readable key.
+    """
+    fingerprint = key.get_fingerprint()
+
+    if six.PY3:
+        # On Python 3, iterating through the byte string will give us integers.
+        # No need for ord().
+        values = fingerprint
+    else:
+        # On Python 2, iterating through the byte string will give us
+        # characters, so we'll need to convert to integers.
+        values = (
+            ord(c)
+            for c in fingerprint
+        )
+
+    return ':'.join(
+        '%02x' % i
+        for i in values
+    )
 
 
 def is_ssh_uri(url):
@@ -96,14 +126,18 @@ def check_host(netloc, username=None, password=None, namespace=None):
 
 
 def register_rbssh(envvar):
-    """Registers rbssh in an environment variable.
+    """Register rbssh in an environment variable.
 
     This is a convenience method for making sure that rbssh is set properly
     in the environment for different tools. In some cases, we need to
     specifically place it in the system environment using ``os.putenv``,
     while in others (Mercurial, Bazaar), we need to place it in ``os.environ``.
-    """
-    envvar = envvar.encode('utf-8')
 
-    os.putenv(envvar, b'rbssh')
-    os.environ[envvar] = b'rbssh'
+    Args:
+        envvar (unicode or bytes):
+            The name of the environment variable.
+    """
+    envvar = force_str(envvar)
+
+    os.putenv(envvar, str('rbssh'))
+    os.environ[envvar] = str('rbssh')

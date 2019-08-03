@@ -5,6 +5,8 @@
 # A big thanks to Django project for some of the fixes used in here for
 # MacOS X and data files installation.
 
+from __future__ import print_function, unicode_literals
+
 import json
 import os
 import subprocess
@@ -17,19 +19,41 @@ from setuptools.command.develop import develop
 from setuptools.command.egg_info import egg_info
 
 from reviewboard import get_package_version, VERSION
-from reviewboard.dependencies import (build_dependency_list,
+from reviewboard.dependencies import (PYTHON_2_MIN_VERSION,
+                                      PYTHON_2_MIN_VERSION_STR,
+                                      PYTHON_3_MIN_VERSION,
+                                      build_dependency_list,
                                       package_dependencies,
                                       package_only_dependencies)
+
+
+is_packaging = ('sdist' in sys.argv or
+                'bdist_egg' in sys.argv or
+                'bdist_wheel' in sys.argv or
+                'install' in sys.argv)
 
 
 # Make sure this is a version of Python we are compatible with. This should
 # prevent people on older versions from unintentionally trying to install
 # the source tarball, and failing.
-if sys.hexversion < 0x02070000:
+pyver = sys.version_info[:2]
+
+if pyver < PYTHON_2_MIN_VERSION or (3, 0) <= pyver < PYTHON_3_MIN_VERSION:
     sys.stderr.write(
         'Review Board %s is incompatible with your version of Python.\n'
-        'Please install Review Board 2.5.x or upgrade Python to at least '
-        '2.7.\n' % get_package_version())
+        'Please install Review Board 3.0.x or use Python %s.\n'
+        % (get_package_version(), PYTHON_2_MIN_VERSION_STR))
+    sys.exit(1)
+elif (pyver >= PYTHON_3_MIN_VERSION and
+      is_packaging and
+      os.getenv('RB_PY3_HAS_NO_OFFICIAL_SUPPORT') != 'agreed'):
+    sys.stderr.write(
+        'Review Board %s packages are not in any way supported by us '
+        'on Python %s.%s.\n'
+        'To force building of the package, run:\n'
+        '\n'
+        '    RB_PY3_HAS_NO_OFFICIAL_SUPPORT=agreed %s\n'
+        % (get_package_version(), pyver[0], pyver[1], ' '.join(sys.argv)))
     sys.exit(1)
 
 
@@ -46,11 +70,6 @@ if root_dir != '':
 for scheme in INSTALL_SCHEMES.values():
     scheme['data'] = scheme['purelib']
 
-
-is_packaging = ('sdist' in sys.argv or
-                'bdist_egg' in sys.argv or
-                'bdist_wheel' in sys.argv or
-                'install' in sys.argv)
 
 if is_packaging:
     # If we're packaging, include the package-only dependencies.
@@ -88,15 +107,16 @@ class DevelopCommand(develop):
     """
 
     user_options = develop.user_options + [
-        ('no-npm', None, "Don't install packages from npm"),
-        ('use-npm-cache', None, 'Use npm-cache to install packages'),
-        ('with-doc-deps', None, 'Install documentation-related dependencies'),
+        (str('no-npm'), None, "Don't install packages from npm"),
+        (str('use-npm-cache'), None, 'Use npm-cache to install packages'),
+        (str('with-doc-deps'), None,
+         'Install documentation-related dependencies'),
     ]
 
     boolean_options = develop.boolean_options + [
-        'no-npm',
-        'use-npm-cache',
-        'with-doc-deps',
+        str('no-npm'),
+        str('use-npm-cache'),
+        str('with-doc-deps'),
     ]
 
     def initialize_options(self):
@@ -246,11 +266,11 @@ class ListNodeDependenciesCommand(Command):
     description = 'Generate a package.json that lists node.js dependencies'
 
     user_options = [
-        ('to-stdout', None,
+        (str('to-stdout'), None,
          'Write to standard output instead of a package.json file.')
     ]
 
-    boolean_options = ['to-file']
+    boolean_options = [str('to-stdout')]
 
     def initialize_options(self):
         """Set the command's option defaults."""
@@ -303,10 +323,10 @@ class InstallNodeDependenciesCommand(Command):
         'Install the node packages required for building static media.'
 
     user_options = [
-        ('use-npm-cache', None, 'Use npm-cache to install packages'),
+        (str('use-npm-cache'), None, 'Use npm-cache to install packages'),
     ]
 
-    boolean_options = ['use-npm-cache']
+    boolean_options = [str('use-npm-cache')]
 
     def initialize_options(self):
         """Initialize options for the command."""
@@ -344,7 +364,7 @@ class InstallNodeDependenciesCommand(Command):
         # duplicate that list.
         self.run_command('list_node_deps')
 
-        print 'Installing node.js modules...'
+        print('Installing node.js modules...')
         result = os.system('%s install' % npm_command)
 
         os.unlink('package.json')
@@ -461,11 +481,11 @@ setup(
         'reviewboard.auth_backends': build_entrypoints(
             'reviewboard.accounts.backends',
             [
-                ('ad', 'ActiveDirectoryBackend'),
-                ('ldap', 'LDAPBackend'),
-                ('nis', 'NISBackend'),
-                ('x509', 'X509Backend'),
-                ('digest', 'HTTPDigestBackend'),
+                ('ad', 'ad:ActiveDirectoryBackend'),
+                ('ldap', 'ldap:LDAPBackend'),
+                ('nis', 'nis:NISBackend'),
+                ('x509', 'x509:X509Backend'),
+                ('digest', 'http_digest:HTTPDigestBackend'),
             ]
         ),
     },

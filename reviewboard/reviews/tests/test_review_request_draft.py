@@ -3,10 +3,13 @@ from __future__ import unicode_literals
 import os
 
 from django.contrib.auth.models import User
+from djblets.features.testing import override_feature_check
 from kgb import SpyAgency
 
 from reviewboard.accounts.models import Profile
 from reviewboard.attachments.models import FileAttachment
+from reviewboard.changedescs.models import ChangeDescription
+from reviewboard.diffviewer.features import dvcs_feature
 from reviewboard.reviews.errors import PublishError
 from reviewboard.reviews.fields import (BaseEditableField,
                                         BaseTextAreaField,
@@ -21,6 +24,215 @@ class ReviewRequestDraftTests(TestCase):
     """Unit tests for reviewboard.reviews.models.ReviewRequestDraft."""
 
     fixtures = ['test_users', 'test_scmtools']
+
+    def test_create_with_new_draft(self):
+        """Testing ReviewRequestDraft.create with new draft"""
+        user1 = User.objects.create(username='reviewer1')
+        user2 = User.objects.create(username='reviewer2')
+
+        group1 = self.create_review_group(name='group1')
+        group2 = self.create_review_group(name='group2')
+
+        dep_review_request_1 = self.create_review_request(publish=True)
+        dep_review_request_2 = self.create_review_request(publish=True)
+
+        review_request = self.create_review_request(
+            publish=True,
+            bugs_closed='1,20,300',
+            commit_id='abc123',
+            description_rich_text=True,
+            depends_on=[dep_review_request_1, dep_review_request_2],
+            rich_text=True,
+            target_groups=[group1, group2],
+            target_people=[user1, user2],
+            testing_done_rich_text=True,
+            extra_data={
+                'key': {
+                    'values': [1, 2, 3],
+                },
+                'mybool': True,
+            })
+
+        active_file_attachment_1 = self.create_file_attachment(review_request)
+        active_file_attachment_2 = self.create_file_attachment(review_request)
+        inactive_file_attachment = self.create_file_attachment(review_request,
+                                                               active=False)
+
+        active_screenshot_1 = self.create_screenshot(review_request)
+        active_screenshot_2 = self.create_screenshot(review_request)
+        inactive_screenshot = self.create_screenshot(review_request,
+                                                     active=False)
+
+        # Create the draft.
+        draft = ReviewRequestDraft.create(review_request)
+
+        # Make sure all the fields are the same.
+        self.assertEqual(draft.branch, review_request.branch)
+        self.assertEqual(draft.bugs_closed, review_request.bugs_closed)
+        self.assertEqual(draft.commit_id, review_request.commit_id)
+        self.assertEqual(draft.description, review_request.description)
+        self.assertEqual(draft.description_rich_text,
+                         review_request.description_rich_text)
+        self.assertEqual(draft.extra_data, review_request.extra_data)
+        self.assertEqual(draft.rich_text, review_request.rich_text)
+        self.assertEqual(draft.summary, review_request.summary)
+        self.assertEqual(draft.testing_done, review_request.testing_done)
+        self.assertEqual(draft.testing_done_rich_text,
+                         review_request.testing_done_rich_text)
+
+        self.assertEqual(list(draft.depends_on.order_by('pk')),
+                         [dep_review_request_1, dep_review_request_2])
+        self.assertEqual(list(draft.target_groups.all()),
+                         [group1, group2])
+        self.assertEqual(list(draft.target_people.all()),
+                         [user1, user2])
+        self.assertEqual(list(draft.file_attachments.all()),
+                         [active_file_attachment_1, active_file_attachment_2])
+        self.assertEqual(list(draft.inactive_file_attachments.all()),
+                         [inactive_file_attachment])
+        self.assertEqual(list(draft.screenshots.all()),
+                         [active_screenshot_1, active_screenshot_2])
+        self.assertEqual(list(draft.inactive_screenshots.all()),
+                         [inactive_screenshot])
+
+        self.assertIsNotNone(draft.changedesc)
+
+    def test_create_with_new_draft_and_custom_changedesc(self):
+        """Testing ReviewRequestDraft.create with new draft and custom
+        ChangeDescription
+        """
+        review_request = self.create_review_request(
+            publish=True,
+            bugs_closed='1,20,300',
+            commit_id='abc123',
+            description_rich_text=True,
+            rich_text=True,
+            testing_done_rich_text=True,
+            extra_data={
+                'key': {
+                    'values': [1, 2, 3],
+                },
+                'mybool': True,
+            })
+
+        # Create the draft.
+        changedesc = ChangeDescription.objects.create()
+        orig_draft = ReviewRequestDraft.create(review_request,
+                                               changedesc=changedesc)
+
+        self.assertEqual(orig_draft.changedesc_id, changedesc.pk)
+        self.assertEqual(ChangeDescription.objects.count(), 1)
+
+        # Reload to be sure.
+        draft = ReviewRequestDraft.objects.get(pk=orig_draft.pk)
+        self.assertEqual(orig_draft, draft)
+        self.assertEqual(draft.changedesc, changedesc)
+
+    def test_create_with_existing_new_draft(self):
+        """Testing ReviewRequestDraft.create with existing draft"""
+        review_request = self.create_review_request(
+            publish=True,
+            bugs_closed='1,20,300',
+            commit_id='abc123',
+            description_rich_text=True,
+            rich_text=True,
+            testing_done_rich_text=True,
+            extra_data={
+                'key': {
+                    'values': [1, 2, 3],
+                },
+                'mybool': True,
+            })
+
+        # Create the first draft.
+        orig_draft = ReviewRequestDraft.create(review_request)
+        self.assertIsNotNone(orig_draft.changedesc)
+
+        # Try to create it again.
+        draft = ReviewRequestDraft.create(review_request)
+        self.assertIsNotNone(draft.changedesc)
+
+        self.assertEqual(orig_draft, draft)
+        self.assertEqual(orig_draft.changedesc, draft.changedesc)
+
+    def test_create_with_existing_new_draft_new_custom_changedesc(self):
+        """Testing ReviewRequestDraft.create with existing draft and new
+        custom ChangeDescription
+        """
+        review_request = self.create_review_request(
+            publish=True,
+            bugs_closed='1,20,300',
+            commit_id='abc123',
+            description_rich_text=True,
+            rich_text=True,
+            testing_done_rich_text=True,
+            extra_data={
+                'key': {
+                    'values': [1, 2, 3],
+                },
+                'mybool': True,
+            })
+
+        # Create the first draft.
+        orig_draft = ReviewRequestDraft.create(review_request)
+        self.assertIsNotNone(orig_draft.changedesc)
+
+        # Try to create it again.
+        new_changedesc = ChangeDescription.objects.create()
+        draft = ReviewRequestDraft.create(review_request,
+                                          changedesc=new_changedesc)
+
+        self.assertEqual(orig_draft, draft)
+        self.assertEqual(draft.changedesc, new_changedesc)
+
+        # Reload to be sure.
+        draft = ReviewRequestDraft.objects.get(pk=draft.pk)
+        self.assertEqual(orig_draft, draft)
+        self.assertEqual(draft.changedesc, new_changedesc)
+
+        # Make sure we've deleted the old ChangeDescription.
+        self.assertEqual(list(ChangeDescription.objects.all()),
+                         [new_changedesc])
+
+    def test_create_with_existing_new_draft_existing_custom_changedesc(self):
+        """Testing ReviewRequestDraft.create with existing draft and existing
+        custom ChangeDescription
+        """
+        review_request = self.create_review_request(
+            publish=True,
+            bugs_closed='1,20,300',
+            commit_id='abc123',
+            description_rich_text=True,
+            rich_text=True,
+            testing_done_rich_text=True,
+            extra_data={
+                'key': {
+                    'values': [1, 2, 3],
+                },
+                'mybool': True,
+            })
+
+        # Create the first draft.
+        orig_draft = ReviewRequestDraft.create(review_request)
+        orig_changedesc = orig_draft.changedesc
+        self.assertIsNotNone(orig_changedesc)
+
+        # Try to create it again.
+        draft = ReviewRequestDraft.create(review_request,
+                                          changedesc=orig_changedesc)
+
+        self.assertEqual(orig_draft, draft)
+        self.assertEqual(draft.changedesc, orig_changedesc)
+
+        # Reload to be sure.
+        draft = ReviewRequestDraft.objects.get(pk=draft.pk)
+        self.assertEqual(orig_draft, draft)
+        self.assertEqual(draft.changedesc, orig_changedesc)
+
+        # Make sure we have not created any new ChangeDescription in the
+        # database.
+        self.assertEqual(list(ChangeDescription.objects.all()),
+                         [orig_changedesc])
 
     def test_publish_records_fields(self):
         """Testing ReviewRequestDraft.publish records changes"""
@@ -416,6 +628,142 @@ class ReviewRequestDraftTests(TestCase):
             fieldset.remove_field(SpecialRichField)
             fieldset.remove_field(BasicField)
 
+    def test_publish_without_reviewer_or_group(self):
+        """Testing ReviewRequestDraft.publish when there isn't a reviewer or
+        group name"""
+        review_request = self.create_review_request()
+        draft = ReviewRequestDraft.create(review_request)
+        draft.summary = 'New summary'
+        draft.description = 'New description'
+        draft.testing_done = 'New testing done'
+        draft.branch = 'New branch'
+        draft.bugs_closed = '12, 34, 56'
+        error_message = ('There must be at least one reviewer before this '
+                         'review request can be published.')
+
+        with self.assertRaisesMessage(PublishError, error_message):
+            draft.publish()
+
+    def test_publish_without_summary(self):
+        """Testing publish when there isn't a summary"""
+        review_request = self.create_review_request()
+        draft = ReviewRequestDraft.create(review_request)
+
+        target_person = User.objects.get(username='doc')
+
+        draft.description = 'New description'
+        draft.testing_done = 'New testing done'
+        draft.branch = 'New branch'
+        draft.bugs_closed = '12, 34, 56'
+        draft.target_people = [target_person]
+        # Summary is set by default in create_review_request
+        draft.summary = ''
+
+        error_message = 'The draft must have a summary.'
+
+        with self.assertRaisesMessage(PublishError, error_message):
+            draft.publish()
+
+    def test_publish_without_description(self):
+        """Testing publish when there isn't a description"""
+        review_request = self.create_review_request()
+        draft = ReviewRequestDraft.create(review_request)
+
+        target_person = User.objects.get(username='doc')
+
+        draft.testing_done = 'New testing done'
+        draft.branch = 'New branch'
+        draft.bugs_closed = '12, 34, 56'
+        draft.target_people = [target_person]
+        # Description is set by default in create_review_request
+        draft.description = ''
+        error_message = 'The draft must have a description.'
+
+        with self.assertRaisesMessage(PublishError, error_message):
+            draft.publish()
+
+    def test_publish_with_history_no_commits_in_diffset(self):
+        """Testing ReviewRequestDraft.publish when the diffset has no commits
+        """
+        review_request = self.create_review_request(create_with_history=True,
+                                                    create_repository=True)
+        self.create_diffset(review_request, draft=True)
+
+        target_person = User.objects.get(username='doc')
+
+        draft = review_request.get_draft()
+        draft.target_people = [target_person]
+        draft.summary = 'Summary'
+        draft.description = 'Description'
+        draft.save()
+
+        error_msg = 'There are no commits attached to the diff.'
+
+        with self.assertRaisesMessage(PublishError, error_msg):
+            draft.publish()
+
+    def test_publish_with_history_diffset_not_finalized(self):
+        """Testing ReviewRequestDraft.publish for a review request created with
+        commit history support when the diffset has not been finalized
+        """
+        with override_feature_check(dvcs_feature.feature_id, enabled=True):
+            review_request = self.create_review_request(
+                create_with_history=True,
+                create_repository=True)
+            self.create_diffset(review_request, draft=True)
+            draft = review_request.get_draft()
+
+            draft.target_people = [review_request.submitter]
+
+            error_msg = \
+                'Error publishing: There are no commits attached to the diff'
+
+            with self.assertRaisesMessage(PublishError, error_msg):
+                draft.publish()
+
+    def test_publish_with_history_diffset_finalized(self):
+        """Testing ReviewRequestDraft.publish for a review request created with
+        commit history support when the diffset has been finalized
+        """
+        with override_feature_check(dvcs_feature.feature_id, enabled=True):
+            review_request = self.create_review_request(
+                create_with_history=True,
+                create_repository=True)
+            diffset = self.create_diffset(review_request=review_request,
+                                          draft=True)
+            self.create_diffcommit(diffset=diffset)
+            diffset.finalize_commit_series(
+                cumulative_diff=self.DEFAULT_GIT_FILEDIFF_DATA_DIFF,
+                validation_info=None,
+                validate=False,
+                save=True)
+
+            draft = review_request.get_draft()
+            draft.target_people = [review_request.submitter]
+            draft.publish()
+
+            review_request = ReviewRequest.objects.get(pk=review_request.pk)
+            self.assertEqual(review_request.status,
+                             ReviewRequest.PENDING_REVIEW)
+
+    def test_publish_without_history_not_finalized(self):
+        """Testing ReviewRequestDraft.publish for a review request created
+        without commit history support when the diffset has not been finalized
+        """
+        with override_feature_check(dvcs_feature.feature_id, enabled=True):
+            review_request = self.create_review_request(
+                create_repository=True)
+            diffset = self.create_diffset(review_request, draft=True)
+            draft = review_request.get_draft()
+            draft.target_people = [review_request.submitter]
+            self.create_filediff(diffset=diffset)
+
+            draft.publish()
+
+            review_request = ReviewRequest.objects.get(pk=review_request.pk)
+            self.assertEqual(review_request.status,
+                             ReviewRequest.PENDING_REVIEW)
+
     def _get_draft(self):
         """Convenience function for getting a new draft to work with."""
         review_request = self.create_review_request(publish=True)
@@ -432,8 +780,7 @@ class PostCommitTests(SpyAgency, TestCase):
 
         self.user = User.objects.create_user(username='testuser', password='',
                                              email='email@example.com')
-        self.profile, is_new = Profile.objects.get_or_create(user=self.user)
-        self.profile.save()
+        self.profile = self.user.get_profile()
 
         self.testdata_dir = os.path.join(
             os.path.dirname(os.path.dirname(__file__)),
@@ -451,11 +798,8 @@ class PostCommitTests(SpyAgency, TestCase):
             self.assertEqual(commit_id, commit_to_get)
 
             commit = Commit(message='This is my commit message\n\n'
-                                    'With a summary line too.')
-            diff_filename = os.path.join(self.testdata_dir, 'git_readme.diff')
-
-            with open(diff_filename, 'r') as f:
-                commit.diff = f.read()
+                                    'With a summary line too.',
+                            diff=self.DEFAULT_GIT_README_DIFF)
 
             return commit
 
@@ -489,11 +833,8 @@ class PostCommitTests(SpyAgency, TestCase):
         """
         def get_change(repository, commit_to_get):
             commit = Commit(
-                message='* This is a summary\n\n* This is a description.')
-            diff_filename = os.path.join(self.testdata_dir, 'git_readme.diff')
-
-            with open(diff_filename, 'r') as f:
-                commit.diff = f.read()
+                message='* This is a summary\n\n* This is a description.',
+                diff=self.DEFAULT_GIT_README_DIFF)
 
             return commit
 
@@ -541,63 +882,17 @@ class PostCommitTests(SpyAgency, TestCase):
         """Testing ReviewRequestDraft.update_from_commit_id without
         supports_post_commmit for repository
         """
-        self.spy_on(self.repository.__class__.supports_post_commit.fget,
-                    call_fake=lambda self: False)
-        review_request = ReviewRequest.objects.create(self.user,
-                                                      self.repository)
-        draft = ReviewRequestDraft.create(review_request)
+        scmtool_cls = type(self.repository.get_scmtool())
 
-        with self.assertRaises(NotImplementedError):
-            draft.update_from_commit_id('4')
+        old_supports_post_commit = scmtool_cls.supports_post_commit
+        scmtool_cls.supports_post_commit = False
 
-    def test_publish_without_reviewer_or_group(self):
-        """Testing ReviewRequestDraft.publish when there isn't a reviewer or
-        group name"""
-        review_request = self.create_review_request()
-        draft = ReviewRequestDraft.create(review_request)
-        draft.summary = 'New summary'
-        draft.description = 'New description'
-        draft.testing_done = 'New testing done'
-        draft.branch = 'New branch'
-        draft.bugs_closed = '12, 34, 56'
-        error_message = ('There must be at least one reviewer before this '
-                         'review request can be published.')
+        try:
+            review_request = ReviewRequest.objects.create(self.user,
+                                                          self.repository)
+            draft = ReviewRequestDraft.create(review_request)
 
-        with self.assertRaisesMessage(PublishError, error_message):
-            draft.publish()
-
-    def test_publish_without_summary(self):
-        """Testing publish when there isn't a summary"""
-
-        review_request = self.create_review_request()
-        draft = ReviewRequestDraft.create(review_request)
-
-        draft.description = 'New description'
-        draft.testing_done = 'New testing done'
-        draft.branch = 'New branch'
-        draft.bugs_closed = '12, 34, 56'
-        draft.target_people = [self.user]
-        # Summary is set by default in create_review_request
-        draft.summary = ''
-
-        error_message = 'The draft must have a summary.'
-
-        with self.assertRaisesMessage(PublishError, error_message):
-            draft.publish()
-
-    def test_publish_without_description(self):
-        """Testing publish when there isn't a description"""
-
-        review_request = self.create_review_request()
-        draft = ReviewRequestDraft.create(review_request)
-
-        draft.testing_done = 'New testing done'
-        draft.branch = 'New branch'
-        draft.bugs_closed = '12, 34, 56'
-        draft.target_people = [self.user]
-        # Description is set by default in create_review_request
-        draft.description = ''
-        error_message = 'The draft must have a description.'
-
-        with self.assertRaisesMessage(PublishError, error_message):
-            draft.publish()
+            with self.assertRaises(NotImplementedError):
+                draft.update_from_commit_id('4')
+        finally:
+            scmtool_cls.supports_post_commit = old_supports_post_commit

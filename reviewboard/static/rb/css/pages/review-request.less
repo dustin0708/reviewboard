@@ -81,6 +81,66 @@
   }
 }
 
+.commit-list {
+  background-color: @review-request-commit-list-bg;
+  border: @review-request-field-border;
+  border-collapse: collapse;
+  margin: @textarea-editor-margin;
+  display: table !important;
+  width: 100%;
+
+  &.changed {
+    .marker {
+      font-family: @textarea-font-family;
+      font-size: @textarea-font-size;
+      font-weight: bold;
+      text-align: center;
+      width: 0;
+    }
+
+    .new-value .marker {
+      background: @diff-insert-linenum-color;
+    }
+
+    .old-value .marker {
+      background: @diff-delete-linenum-color;
+    }
+  }
+
+  .collapse-commit-message,
+  .expand-commit-message {
+    color: @review-request-commit-list-link-color !important;
+  }
+
+  .select-base,
+  .select-tip {
+    width: 0;
+  }
+
+  pre {
+    margin: 0;
+  }
+
+  td,
+  th {
+    border-bottom: @review-request-field-table-divider-border;
+    font-family: @font-family !important;
+    padding: 0.25em 0.5em;
+    vertical-align: baseline;
+  }
+
+  th {
+    text-align: left;
+  }
+
+  tr:last-child td {
+    border-bottom: none;
+  }
+
+  .expand-collapse-control {
+    width: 2em;
+  }
+}
 
 .review-request-section {
   padding: @box-padding;
@@ -121,13 +181,18 @@
   }
 }
 
-#review-request-main {
+.review-request-main-fieldset {
+  display: block;
   margin-right: (@details-width + 10px);
   position: relative;
 
   .on-mobile-medium-screen-720({
     margin-right: 0;
   });
+}
+
+#review-request-main {
+  .review-request-main-fieldset();
 }
 
 #review-request-extra {
@@ -143,6 +208,9 @@
   text-align: center;
 }
 
+#field_commit_list {
+  .review-request-main-fieldset();
+}
 
 /****************************************************************************
  * Review request details pane
@@ -160,7 +228,7 @@
   });
 
   a {
-    color: @review-request-link-color;
+    color: @link-color;
     text-decoration: none;
   }
 
@@ -505,7 +573,7 @@ a.mobile-actions-menu-label {
  ****************************************************************************/
 
 #updates-bubble {
-  background: #FFF1AB;
+  background: @alert-color;
   border-top: 1px #888866 solid;
   border-left: 1px #888866 solid;
   bottom: 0;

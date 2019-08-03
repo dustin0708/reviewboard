@@ -6,9 +6,9 @@ from django.conf import settings
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.models import User
 from django.core.urlresolvers import reverse
-from django.forms.util import ErrorDict
+from django.forms.forms import ErrorDict
 from django.http import HttpResponseRedirect
-from django.shortcuts import get_object_or_404, render_to_response
+from django.shortcuts import get_object_or_404
 from django.utils import six
 from django.utils.decorators import method_decorator
 from django.utils.functional import cached_property
@@ -21,6 +21,7 @@ from djblets.configforms.views import ConfigPagesView
 from djblets.features.decorators import feature_required
 from djblets.forms.fieldsets import filter_fieldsets
 from djblets.siteconfig.models import SiteConfiguration
+from djblets.util.compat.django.shortcuts import render
 from djblets.util.decorators import augment_method_from
 from djblets.views.generic.etag import ETagViewMixin
 
@@ -28,7 +29,8 @@ from reviewboard.accounts.backends import get_enabled_auth_backends
 from reviewboard.accounts.forms.registration import RegistrationForm
 from reviewboard.accounts.mixins import CheckLoginRequiredViewMixin
 from reviewboard.accounts.models import Profile
-from reviewboard.accounts.pages import AccountPage, OAuth2Page
+from reviewboard.accounts.pages import AccountPage, OAuth2Page, PrivacyPage
+from reviewboard.accounts.privacy import is_consent_missing
 from reviewboard.admin.decorators import check_read_only
 from reviewboard.avatars import avatar_services
 from reviewboard.notifications.email.decorators import preview_email
@@ -97,13 +99,9 @@ class UserInfoboxView(CheckLoginRequiredViewMixin,
         user = get_object_or_404(User, username=username)
         self._lookup_user = user
 
-        try:
-            profile = user.get_profile()
-            self._show_profile = not profile.is_private
-            self._timezone = profile.timezone
-        except Profile.DoesNotExist:
-            self._show_profile = True
-            self._timezone = 'UTC'
+        profile = user.get_profile()
+        self._show_profile = user.is_profile_visible(request.user)
+        self._timezone = profile.timezone
 
         etag_data = [
             user.first_name,
@@ -176,9 +174,15 @@ class UserInfoboxView(CheckLoginRequiredViewMixin,
         reviews_url = local_site_reverse('user-grid', local_site=local_site,
                                          args=[username, 'reviews'])
 
+        has_avatar = (
+            avatar_services.avatars_enabled and
+            avatar_services.for_user(user) is not None
+        )
+
         return {
             'extra_content': mark_safe(''.join(extra_content)),
             'full_name': user.get_full_name(),
+            'has_avatar': has_avatar,
             'infobox_user': user,
             'review_requests_url': review_requests_url,
             'reviews_url': reviews_url,
@@ -247,13 +251,37 @@ class MyAccountView(ConfigPagesView):
 
     @property
     def page_classes(self):
-        """Get the list of page classes for this view."""
+        """The list of page classes for this view.
+
+        If the user is missing any consent requirements or has not accepted
+        the privacy policy/terms of service, only the privacy page will be
+        shown.
+        """
+        if self.is_user_missing_consent:
+            return [AccountPage.registry.get('page_id', PrivacyPage.page_id)]
+
         return list(AccountPage.registry)
 
     @cached_property
     def ordered_user_local_sites(self):
         """Get the user's local sites, ordered by name."""
         return self.request.user.local_site.order_by('name')
+
+    @property
+    def render_sidebar(self):
+        """Whether or not to render the sidebar.
+
+        If the user is missing any consent requirements or has not accepted
+        the privacy policy/terms of service, the sidebar will not render.
+        This is to prevent the user from navigating away from the privacy page
+        before making decisions.
+        """
+        return not self.is_user_missing_consent
+
+    @cached_property
+    def is_user_missing_consent(self):
+        """Whether or not the user is missing consent."""
+        return is_consent_missing(self.request.user)
 
 
 @login_required
@@ -317,6 +345,7 @@ def edit_oauth_app(request, app_id=None):
     else:
         form = form_cls(user=request.user, data=None, initial=None,
                         instance=app)
+
         # Show a warning at the top of the form when the form is disabled for
         # security.
         #
@@ -330,9 +359,10 @@ def edit_oauth_app(request, app_id=None):
                 ),
             })
 
-    return render_to_response(
-        'accounts/edit_oauth_app.html',
-        {
+    return render(
+        request=request,
+        template_name='accounts/edit_oauth_app.html',
+        context={
             'app': app,
             'form': form,
             'fieldsets': filter_fieldsets(form=form_cls,

@@ -1,6 +1,8 @@
 {% load djblets_js i18n %}
 
-<script type="text/javascript">
+{{input_html}}
+
+<script>
 $(function() {
     var view = new RB.RelatedUserSelectorView({
         $input: $('#{{input_id|escapejs}}'),

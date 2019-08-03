@@ -1,18 +1,21 @@
 from __future__ import unicode_literals
 
 import logging
+from collections import OrderedDict
 
 from django import forms
 from django.contrib import messages
 from django.core.urlresolvers import reverse
 from django.forms import widgets
-from django.utils.datastructures import SortedDict
+from django.http import HttpResponseRedirect
+from django.utils.six.moves.urllib.parse import unquote
 from django.utils.translation import ugettext_lazy as _
 from djblets.avatars.forms import (
     AvatarSettingsForm as DjbletsAvatarSettingsForm)
-from djblets.forms.fields import TimeZoneField
-from djblets.siteconfig.models import SiteConfiguration
 from djblets.configforms.forms import ConfigPageForm
+from djblets.forms.fields import TimeZoneField
+from djblets.privacy.consent.forms import ConsentConfigPageFormMixin
+from djblets.siteconfig.models import SiteConfiguration
 from oauth2_provider.models import AccessToken
 
 from reviewboard.accounts.backends import get_enabled_auth_backends
@@ -128,7 +131,15 @@ class AccountSettingsForm(AccountPageForm):
             self.cleaned_data['should_send_own_updates']
         profile.settings['enable_desktop_notifications'] = \
             self.cleaned_data['enable_desktop_notifications']
-        profile.save()
+        profile.save(update_fields=(
+            'default_use_rich_text',
+            'open_an_issue',
+            'settings',
+            'should_send_email',
+            'should_send_own_updates',
+            'syntax_highlighting',
+            'timezone',
+        ))
 
         messages.add_message(self.request, messages.INFO,
                              _('Your settings have been saved.'))
@@ -185,7 +196,7 @@ class APITokensForm(AccountPageForm):
         api_tokens = self.user.webapi_tokens.all()
 
         # Group the API tokens by LocalSite or the global site.
-        serialized_api_tokens = SortedDict()
+        serialized_api_tokens = OrderedDict()
         serialized_api_tokens[''] = \
             self._serialize_api_tokens(None, api_tokens)
 
@@ -333,7 +344,12 @@ class ProfileForm(AccountPageForm):
         required=True)
     profile_private = forms.BooleanField(
         required=False,
-        label=_("Keep profile information private"))
+        label=_('Keep profile information private'),
+        help_text=_(
+            'By default, profile information (full name, e-mail address, and '
+            'timezone) is only hidden from users who are not logged in. With '
+            'this setting enabled, it will also be hidden from '
+            'non-administrators.'))
 
     def load(self):
         """Load data for the form."""
@@ -387,7 +403,7 @@ class ProfileForm(AccountPageForm):
 
         profile = self.user.get_profile()
         profile.is_private = self.cleaned_data['profile_private']
-        profile.save()
+        profile.save(update_fields=('is_private',))
 
         messages.add_message(self.request, messages.INFO,
                              _('Your profile has been saved.'))
@@ -414,7 +430,7 @@ class GroupsForm(AccountPageForm):
         joined_group_ids = self.user.review_groups.values_list('pk', flat=True)
 
         # Fetch the list of groups available to the user.
-        serialized_groups = SortedDict()
+        serialized_groups = OrderedDict()
         serialized_groups[''] = self._serialize_groups(None, joined_group_ids)
 
         for local_site in self.page.config_view.ordered_user_local_sites:
@@ -592,3 +608,105 @@ class OAuthTokensForm(AccountPageForm):
             ),
             'application': token.application.name,
         }
+
+
+class PrivacyForm(ConsentConfigPageFormMixin, AccountPageForm):
+    """A form for displaying privacy information and gathering consent.
+
+    This will display a user's privacy rights, link to any configured
+    Privacy Policy document, and display a form for gathering consent for
+    features that make use of the user's personally identifying information.
+    """
+
+    next_url = forms.CharField(required=False,
+                               widget=forms.HiddenInput)
+
+    form_title = _('My Privacy Rights')
+    template_name = 'accounts/privacy_form.html'
+
+    def __init__(self, *args, **kwargs):
+        """Initialize the form.
+
+        Args:
+            *args (tuple):
+                Positional arguments to pass to the parent form.
+
+            **kwargs (dict):
+                Keyword arguments to pass to the parent form.
+        """
+        super(PrivacyForm, self).__init__(*args, **kwargs)
+
+        siteconfig = SiteConfiguration.objects.get_current()
+
+        if not siteconfig.get('privacy_enable_user_consent'):
+            del self.fields[self.consent_field_name]
+            self.save_label = None
+
+    def load(self):
+        """Load the form data.
+
+        If a ``?next`` query argument is provided, it will be loaded into the
+        initial value for the ``next_url`` so that it will persist through
+        page submission.
+        """
+        super(PrivacyForm, self).load()
+
+        next_url = self.request.GET.get('next')
+
+        if next_url:
+            self.set_initial({'next_url': unquote(next_url)})
+
+    def is_visible(self):
+        """Return whether or not the form should be rendered.
+
+        This will check if there's any information to display in this form.
+        It's only displayed if consent requirements are enabled or there's
+        any privacy information configured in Admin Settings.
+
+        Returns
+            bool:
+            Whether or not the form should be rendered.
+        """
+        siteconfig = SiteConfiguration.objects.get_current()
+
+        return (siteconfig.get('privacy_enable_user_consent') or
+                bool(siteconfig.get('privacy_info_html')))
+
+    def get_extra_context(self):
+        """Return extra context for the template.
+
+        Returns:
+            dict:
+            Context used for rendering the form's template.
+        """
+        siteconfig = SiteConfiguration.objects.get_current()
+
+        return {
+            'privacy_info_html': siteconfig.get('privacy_info_html'),
+        }
+
+    def clean_next_url(self):
+        """Clean the next_url field.
+
+        Returns:
+            unicode:
+            The URL to redirect to, if any.
+        """
+        return self.cleaned_data.get('next_url', '').strip() or None
+
+    def save(self):
+        """Save the privacy form.
+
+        This may redirect the user to the next URL if it is specified.
+
+        Returns:
+            django.http.HttpResponseRedirect:
+            A redirect to the next URL if given and ``None`` otherwise.
+        """
+        next_url = self.cleaned_data.get('next_url')
+
+        if next_url:
+            self.save_consent(self.request.user)
+            return HttpResponseRedirect(next_url)
+        else:
+            return super(PrivacyForm, self).save()

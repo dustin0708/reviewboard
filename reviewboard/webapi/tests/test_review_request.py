@@ -1,11 +1,13 @@
 from __future__ import unicode_literals
 
+import django
 from django.contrib import auth
 from django.contrib.auth.models import User, Permission
 from django.db.models import Q
 from django.utils import six
 from django.utils.timezone import get_current_timezone
 from djblets.db.query import get_object_or_none
+from djblets.features.testing import override_feature_check
 from djblets.testing.decorators import add_fixtures
 from djblets.webapi.errors import (DOES_NOT_EXIST,
                                    INVALID_FORM_DATA,
@@ -17,6 +19,7 @@ from pytz import timezone
 from reviewboard.accounts.backends import AuthBackend
 from reviewboard.accounts.models import LocalSiteProfile
 from reviewboard.admin.server import build_server_url
+from reviewboard.diffviewer.features import dvcs_feature
 from reviewboard.reviews.models import (BaseComment, ReviewRequest,
                                         ReviewRequestDraft)
 from reviewboard.reviews.signals import (review_request_closing,
@@ -25,7 +28,8 @@ from reviewboard.reviews.signals import (review_request_closing,
 from reviewboard.reviews.errors import CloseError, PublishError, ReopenError
 from reviewboard.site.models import LocalSite
 from reviewboard.webapi.errors import (CLOSE_ERROR, INVALID_REPOSITORY,
-                                       PUBLISH_ERROR, REOPEN_ERROR)
+                                       PUBLISH_ERROR, REOPEN_ERROR,
+                                       REPO_INFO_ERROR)
 from reviewboard.webapi.resources import resources
 from reviewboard.webapi.tests.base import BaseWebAPITestCase
 from reviewboard.webapi.tests.mimetypes import (review_item_mimetype,
@@ -53,8 +57,9 @@ class ResourceListTests(SpyAgency, ExtraDataListMixin, BaseWebAPITestCase):
     def compare_item(self, item_rsp, review_request):
         self.assertEqual(item_rsp['id'], review_request.display_id)
         self.assertEqual(item_rsp['summary'], review_request.summary)
-        self.assertEqual(item_rsp['extra_data'], review_request.extra_data)
-
+        self.assertEqual(
+            item_rsp['extra_data'],
+            self.resource.serialize_extra_data_field(review_request))
     #
     # HTTP GET tests
     #
@@ -804,6 +809,7 @@ class ResourceListTests(SpyAgency, ExtraDataListMixin, BaseWebAPITestCase):
                          commit_id)
 
     @add_fixtures(['test_scmtools'])
+    @webapi_test_template
     def test_get_num_queries(self):
         """Testing the GET <URL> API for number of queries"""
         repo = self.create_repository()
@@ -818,7 +824,17 @@ class ResourceListTests(SpyAgency, ExtraDataListMixin, BaseWebAPITestCase):
             self.create_diffset(review_request)
             self.create_diffset(review_request)
 
-        with self.assertNumQueries(13):
+        # Modern versions of Django will result in one fewer query than 1.6.
+        # Specifically, the prefetch_related('diffset_history_diffsets') call
+        # in ReviewRequestResource.get_queryset() doesn't need to perform a
+        # fetch of the DiffSetHistory, instead utilizing the one we fetched
+        # in the select_related(). On 1.6, it will need to fetch it anyway.
+        if django.VERSION[:2] >= (1, 11):
+            expected_queries = 12
+        else:
+            expected_queries = 13
+
+        with self.assertNumQueries(expected_queries):
             rsp = self.api_get(get_review_request_list_url(),
                                expected_mimetype=review_request_list_mimetype)
 
@@ -1065,6 +1081,44 @@ class ResourceListTests(SpyAgency, ExtraDataListMixin, BaseWebAPITestCase):
         self.assertEqual(draft.description, 'Commit description.')
 
     @add_fixtures(['test_scmtools'])
+    def test_post_with_commit_id_and_hosting_service_error(self):
+        """Testing the POST review-requests/ API with commit_id lookup causing
+        HostingServiceError
+        """
+        repository = self.create_repository(tool_name='Test')
+
+        rsp = self.api_post(
+            get_review_request_list_url(),
+            {
+                'repository': repository.name,
+                'commit_id': 'bad:hosting-service-error',
+                'create_from_commit_id': True,
+            },
+            expected_status=500)
+        self.assertEqual(rsp['stat'], 'fail')
+        self.assertEqual(rsp['err']['code'], REPO_INFO_ERROR.code)
+        self.assertEqual(rsp['err']['msg'], 'This is a HostingServiceError')
+
+    @add_fixtures(['test_scmtools'])
+    def test_post_with_commit_id_and_scm_error(self):
+        """Testing the POST review-requests/ API with commit_id lookup causing
+        SCMError
+        """
+        repository = self.create_repository(tool_name='Test')
+
+        rsp = self.api_post(
+            get_review_request_list_url(),
+            {
+                'repository': repository.name,
+                'commit_id': 'bad:scm-error',
+                'create_from_commit_id': True,
+            },
+            expected_status=500)
+        self.assertEqual(rsp['stat'], 'fail')
+        self.assertEqual(rsp['err']['code'], REPO_INFO_ERROR.code)
+        self.assertEqual(rsp['err']['msg'], 'This is a SCMError')
+
+    @add_fixtures(['test_scmtools'])
     @webapi_test_template
     def test_post_with_changenum(self):
         """Testing the POST <URL> API with changenum"""
@@ -1123,12 +1177,9 @@ class ResourceListTests(SpyAgency, ExtraDataListMixin, BaseWebAPITestCase):
 
         local_site = self.get_local_site(name=self.local_site_name)
 
-        site_profile = LocalSiteProfile.objects.create(
-            local_site=local_site,
-            user=self.user,
-            profile=self.user.get_profile())
+        site_profile = self.user.get_site_profile(local_site)
         site_profile.permissions['reviews.can_submit_as_another_user'] = True
-        site_profile.save()
+        site_profile.save(update_fields=('permissions',))
 
         self._test_post_with_submit_as(local_site)
 
@@ -1159,6 +1210,204 @@ class ResourceListTests(SpyAgency, ExtraDataListMixin, BaseWebAPITestCase):
         self.assertEqual(rsp['stat'], 'fail')
         self.assertEqual(rsp['err']['code'], PERMISSION_DENIED.code)
 
+    @add_fixtures(['test_scmtools'])
+    @webapi_test_template
+    def test_post_create_with_history_enabled(self):
+        """Testing the POST <URL> API with create_with_history=True when the
+        DVCS feature is enabled
+        """
+        repository = self.create_repository(tool_name='Git')
+
+        with override_feature_check(dvcs_feature.feature_id, enabled=True):
+            rsp = self.api_post(
+                get_review_request_list_url(),
+                {
+                    'repository': repository.path,
+                    'create_with_history': True,
+                },
+                expected_mimetype=review_request_item_mimetype)
+
+        self.assertEqual(rsp['stat'], 'ok')
+
+        item_rsp = rsp['review_request']
+        review_request = ReviewRequest.objects.get(pk=item_rsp['id'])
+
+        self.assertTrue(review_request.created_with_history)
+        self.compare_item(item_rsp, review_request)
+
+    @add_fixtures(['test_scmtools'])
+    @webapi_test_template
+    def test_post_create_with_history_disabled(self):
+        """Testing the POST <URL> API with create_with_history=True when the
+        DVCS feature is disabled
+        """
+        repository = self.create_repository(tool_name='Git')
+
+        with override_feature_check(dvcs_feature.feature_id, enabled=False):
+            rsp = self.api_post(
+                get_review_request_list_url(),
+                {
+                    'repository': repository.path,
+                    'create_with_history': True,
+                },
+                expected_mimetype=review_request_item_mimetype)
+
+        self.assertEqual(rsp['stat'], 'ok')
+
+        item_rsp = rsp['review_request']
+        review_request = ReviewRequest.objects.get(pk=item_rsp['id'])
+
+        self.assertNotIn('created_with_history', item_rsp)
+        self.assertFalse(review_request.created_with_history)
+        self.compare_item(item_rsp, review_request)
+
+    @add_fixtures(['test_scmtools'])
+    @webapi_test_template
+    def test_post_create_with_history_enabled_and_create_from_commit_id(self):
+        """Testing the POST <URL> API with create_with_history=True and
+        create_from_commit_id=True
+        """
+        repository = self.create_repository(tool_name='Git')
+
+        with override_feature_check(dvcs_feature.feature_id, enabled=True):
+            rsp = self.api_post(
+                get_review_request_list_url(),
+                {
+                    'repository': repository.path,
+                    'create_with_history': True,
+                    'create_from_commit_id': True,
+                    'commit_id': '0' * 40,
+                },
+                expected_status=400)
+
+        self.assertEqual(rsp['stat'], 'fail')
+        self.assertEqual(rsp['err']['code'], INVALID_FORM_DATA.code)
+        self.assertEqual(rsp['reason'],
+                         'create_from_commit_id and create_with_history '
+                         'cannot both be set to True.')
+
+    @add_fixtures(['test_scmtools'])
+    @webapi_test_template
+    def test_post_create_with_history_disabled_and_create_from_commit_id(self):
+        """Testing the POST <URL> API with create_with_history=True and
+        create_from_commit_id=True when the DVCS feature is disabled
+        """
+        repository = self.create_repository(tool_name='Test')
+
+        with override_feature_check(dvcs_feature.feature_id, enabled=False):
+            rsp = self.api_post(
+                get_review_request_list_url(),
+                {
+                    'repository': repository.path,
+                    'create_with_history': True,
+                    'create_from_commit_id': True,
+                    'commit_id': '0' * 40,
+                },
+                expected_mimetype=review_request_item_mimetype,
+                expected_status=201)
+
+        self.assertEqual(rsp['stat'], 'ok')
+        self.assertIn('review_request', rsp)
+
+        item_rsp = rsp['review_request']
+        review_request = ReviewRequest.objects.get(pk=item_rsp['id'])
+        self.assertFalse(review_request.created_with_history)
+
+        self.compare_item(item_rsp, review_request)
+
+    @add_fixtures(['test_scmtools'])
+    @webapi_test_template
+    def test_post_create_with_history_enabled_no_repository(self):
+        """Testing the POST <URL> API with no repository when the DVCS feature
+        is enabled
+        """
+        with override_feature_check(dvcs_feature.feature_id, enabled=True):
+            rsp = self.api_post(
+                get_review_request_list_url(),
+                {
+                    'create_with_history': True,
+                },
+                expected_status=400)
+
+        self.assertEqual(rsp['stat'], 'fail')
+        self.assertEqual(rsp['err']['code'], INVALID_FORM_DATA.code)
+        self.assertEqual(rsp['reason'],
+                         'create_with_history requires a repository.')
+
+    @add_fixtures(['test_scmtools'])
+    @webapi_test_template
+    def test_post_create_with_history_disabled_no_repository(self):
+        """Testing the POST <URL> API with nor repository when the DVCS feature
+        is disabled
+        """
+        with override_feature_check(dvcs_feature.feature_id, enabled=False):
+            rsp = self.api_post(
+                get_review_request_list_url(),
+                {
+                    'create_with_history': True,
+                },
+                expected_mimetype=review_request_item_mimetype,
+                expected_status=201)
+
+        self.assertEqual(rsp['stat'], 'ok')
+        self.assertIn('review_request', rsp)
+
+        item_rsp = rsp['review_request']
+        review_request = ReviewRequest.objects.get(pk=item_rsp['id'])
+        self.assertFalse(review_request.created_with_history)
+
+        self.compare_item(item_rsp, review_request)
+
+    @add_fixtures(['test_scmtools'])
+    @webapi_test_template
+    def test_post_create_with_history_enabled_unsupported_tool(self):
+        """Testing the POST <URL> API with create_with_history=True for a
+        repository that does not supported when the DVCS feature is enabled
+        """
+        repository = self.create_repository(tool_name='Test')
+
+        with override_feature_check(dvcs_feature.feature_id, True):
+            rsp = self.api_post(
+                get_review_request_list_url(),
+                {
+                    'repository': repository.path,
+                    'create_with_history': True,
+                },
+                expected_status=400)
+
+        self.assertEqual(rsp['stat'], 'fail')
+        self.assertEqual(rsp['err']['code'], INVALID_FORM_DATA.code)
+        self.assertEqual(rsp['reason'],
+                         'This repository does not support review requests '
+                         'created with history.')
+
+    @add_fixtures(['test_scmtools'])
+    @webapi_test_template
+    def test_post_create_with_history_disabled_unsupported_tool(self):
+        """Testing the POST <URL> API with create_with_history=True for a
+        repository that does not supported when the DVCS feature is disabled
+        """
+        repository = self.create_repository(tool_name='Test')
+
+        with override_feature_check(dvcs_feature.feature_id, False):
+            rsp = self.api_post(
+                get_review_request_list_url(),
+                {
+                    'repository': repository.path,
+                    'create_with_history': True,
+                },
+                expected_mimetype=review_request_item_mimetype,
+                expected_status=201)
+
+        self.assertEqual(rsp['stat'], 'ok')
+        self.assertIn('review_request', rsp)
+
+        item_rsp = rsp['review_request']
+        review_request = ReviewRequest.objects.get(pk=item_rsp['id'])
+
+        self.assertNotIn('created_with_history', item_rsp)
+        self.compare_item(item_rsp, review_request)
+
     def test_get_or_create_user_auth_backend(self):
         """Testing the POST review-requests/?submit_as= API
         with AuthBackend.get_or_create_user failure
@@ -1176,7 +1425,9 @@ class ResourceListTests(SpyAgency, ExtraDataListMixin, BaseWebAPITestCase):
         self.spy_on(auth.get_backends, call_fake=lambda: [backend])
 
         # First spy messes with User.has_perm, this lets it through
-        self.spy_on(User.has_perm, call_fake=lambda *args, **kwargs: True)
+        self.spy_on(User.has_perm,
+                    owner=User,
+                    call_fake=lambda *args, **kwargs: True)
         self.spy_on(backend.get_or_create_user)
 
         rsp = self.api_post(
@@ -1234,7 +1485,9 @@ class ResourceItemTests(ExtraDataItemMixin, BaseWebAPITestCase):
     def compare_item(self, item_rsp, review_request):
         self.assertEqual(item_rsp['id'], review_request.display_id)
         self.assertEqual(item_rsp['summary'], review_request.summary)
-        self.assertEqual(item_rsp['extra_data'], review_request.extra_data)
+        self.assertEqual(
+            item_rsp['extra_data'],
+            self.resource.serialize_extra_data_field(review_request))
         self.assertEqual(item_rsp['absolute_url'],
                          self.base_url + review_request.get_absolute_url())
 
@@ -1295,12 +1548,9 @@ class ResourceItemTests(ExtraDataItemMixin, BaseWebAPITestCase):
         self.user = self._login_user(local_site=True)
         local_site = self.get_local_site(name=self.local_site_name)
 
-        site_profile = LocalSiteProfile.objects.create(
-            user=self.user,
-            local_site=local_site,
-            profile=self.user.get_profile())
+        site_profile = self.user.get_site_profile(local_site)
         site_profile.permissions['reviews.delete_reviewrequest'] = True
-        site_profile.save()
+        site_profile.save(update_fields=('permissions',))
 
         review_request = self.create_review_request(with_local_site=True)
 
@@ -1401,6 +1651,7 @@ class ResourceItemTests(ExtraDataItemMixin, BaseWebAPITestCase):
                               check_etags=True)
 
     @add_fixtures(['test_scmtools'])
+    @webapi_test_template
     def test_get_with_latest_diff(self):
         """Testing the GET <URL> API and checking for the latest diff"""
         repo = self.create_repository()
@@ -1429,6 +1680,7 @@ class ResourceItemTests(ExtraDataItemMixin, BaseWebAPITestCase):
             diff_link['href'],
             build_server_url(resources.diff.get_href(latest, None)))
 
+    @webapi_test_template
     def test_get_with_no_latest_diff(self):
         """Testing the GET <URL> API and checking that there is no latest_diff
         link for review requests without a repository
@@ -1464,6 +1716,55 @@ class ResourceItemTests(ExtraDataItemMixin, BaseWebAPITestCase):
         self.assertIn('issue_open_count', rr)
         self.assertIn('issue_resolved_count', rr)
         self.assertIn('issue_verifying_count', rr)
+
+    @webapi_test_template
+    def test_get_dvcs_feature_enabled(self):
+        """Testing the GET <URL> API includes DVCS-specific fields and links in
+        the response when the DVCS feature is enabled
+        """
+        with override_feature_check(dvcs_feature.feature_id, enabled=True):
+            review_request = self.create_review_request(publish=True)
+            rsp = self.api_get(get_review_request_item_url(review_request.pk),
+                               expected_mimetype=review_request_item_mimetype)
+
+            self.assertIn('review_request', rsp)
+            item_rsp = rsp['review_request']
+
+            self.assertIn('created_with_history', item_rsp)
+            self.assertFalse(item_rsp['created_with_history'])
+
+    @webapi_test_template
+    def test_get_dvcs_feature_disabled(self):
+        """Testing the GET <URL> API does not include DVCS-specific fields and
+        links in the response when the DVCS feature is disabled
+        """
+        with override_feature_check(dvcs_feature.feature_id, enabled=False):
+            review_request = self.create_review_request(publish=True)
+            rsp = self.api_get(get_review_request_item_url(review_request.pk),
+                               expected_mimetype=review_request_item_mimetype)
+
+            self.assertIn('review_request', rsp)
+            item_rsp = rsp['review_request']
+
+            self.assertNotIn('created_with_history', item_rsp)
+
+    @webapi_test_template
+    def test_get_dvcs_feature_disabled_only_fields(self):
+        """Testing the GET <URL> API serialization with the DVCS feature
+        enabled and ?only-fields excluding `created_with_history`
+        """
+        with override_feature_check(dvcs_feature.feature_id, enabled=False):
+            review_request = self.create_review_request(publish=True)
+            rsp = self.api_get(
+                ('%s?only-fields=id'
+                 % get_review_request_item_url(review_request.pk)),
+                expected_mimetype=review_request_item_mimetype)
+
+            self.assertIn('review_request', rsp)
+            item_rsp = rsp['review_request']
+
+            self.assertIn('id', item_rsp)
+            self.assertNotIn('created_with_history', item_rsp)
 
     #
     # HTTP PUT tests
@@ -1698,12 +1999,9 @@ class ResourceItemTests(ExtraDataItemMixin, BaseWebAPITestCase):
 
         local_site = self.get_local_site(name=self.local_site_name)
 
-        site_profile = LocalSiteProfile.objects.create(
-            local_site=local_site,
-            user=self.user,
-            profile=self.user.get_profile())
+        site_profile = self.user.get_site_profile(local_site)
         site_profile.permissions['reviews.can_change_status'] = True
-        site_profile.save()
+        site_profile.save(update_fields=('permissions',))
 
         self._test_put_status_as_other_user(local_site)
 

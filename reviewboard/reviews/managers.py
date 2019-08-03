@@ -36,28 +36,89 @@ class DefaultReviewerManager(Manager):
 
 class ReviewGroupManager(Manager):
     """A manager for Group models."""
-    def accessible(self, user, visible_only=True, local_site=None):
-        """Returns groups that are accessible by the given user."""
+
+    def accessible(self, user, visible_only=True, local_site=None,
+                   show_all_local_sites=False):
+        """Return a queryset for review groups accessible by the given user.
+
+        For superusers, all public and invite-only review groups will be
+        returned.
+
+        For regular users, only review groups that are public or that the
+        user is on the access list for will be returned.
+
+        For anonymous users, only public review groups will be returned.
+
+        The returned list is further filtered down based on the
+        ``visible_only``, ``local_site``, and ``show_all_local_sites``
+        parameters.
+
+        Args:
+            user (django.contrib.auth.models.User):
+                The user that must have access to any returned groups.
+
+            visible_only (bool, optional):
+                Whether only visible review groups should be returned.
+
+            local_site (reviewboard.site.models.LocalSite, optional):
+                A specific :term:`Local Site` that the groups must be
+                associated with. By default, this will only return groups
+                not part of a site.
+
+            show_all_local_sites (bool, optional):
+                Whether review groups for all :term:`Local Sites` should be
+                returned. This cannot be ``True`` if a ``local_site`` argument
+                was provided.
+
+        Returns:
+            django.db.models.query.QuerySet:
+            The resulting queryset.
+        """
         if user.is_superuser:
             qs = self.all()
+
+            if visible_only:
+                qs = qs.filter(visible=True)
         else:
             q = Q()
 
-            if not user.has_perm('reviews.can_view_invite_only_groups'):
+            if not user.has_perm('reviews.can_view_invite_only_groups',
+                                 local_site):
                 q = Q(invite_only=False)
 
             if visible_only:
-                q = q & Q(visible=True)
+                # We allow accessible() to return hidden groups if the user is
+                # a member, so we must perform this check here.
+                q &= Q(visible=True)
 
             if user.is_authenticated():
-                q = q | Q(users__pk=user.pk)
+                q |= Q(users=user.pk)
 
-            qs = self.filter(q).distinct()
+            qs = self.filter(q)
 
-        return qs.filter(local_site=local_site)
+        if show_all_local_sites:
+            assert local_site is None
+        else:
+            qs = qs.filter(local_site=local_site)
+
+        return qs.distinct()
 
     def accessible_ids(self, *args, **kwargs):
-        """Return IDs of groups that are accessible by the given user."""
+        """Return IDs of groups that are accessible by the given user.
+
+        This wraps :py:meth:`accessible` and takes the same arguments.
+
+        Args:
+            *args (tuple):
+                Positional arguments to pass to :py:meth:`accessible`.
+
+            **kwargs (dict):
+                Keyword arguments to pass to :py:meth:`accessible`.
+
+        Returns:
+            list of int:
+            The list of IDs.
+        """
         return self.accessible(*args, **kwargs).values_list('pk', flat=True)
 
     def can_create(self, user, local_site=None):
@@ -111,10 +172,57 @@ class ReviewRequestManager(ConcurrencyManager):
         return ReviewRequestQuerySet(self.model)
 
     def create(self, user, repository, commit_id=None, local_site=None,
-               create_from_commit_id=False):
-        """
-        Creates a new review request, optionally filling in fields based off
-        a commit ID.
+               create_from_commit_id=False, create_with_history=False):
+        """Create a new review request.
+
+        Args:
+            user (django.contrib.auth.models.User):
+                The user creating the review request. They will be tracked as
+                the submitter.
+
+            repository (reviewboard.scmtools.Models.Repository):
+                The repository, if any, the review request is associated with.
+
+                If ``None``, diffs cannot be added to the review request.
+
+            commit_id (unicode, optional):
+                An optional commit ID.
+
+            local_site (reviewboard.site.models.LocalSite, optional):
+                An optional LocalSite to associate the review request with.
+
+            create_from_commit_id (bool, optional):
+                Whether or not the given ``commit_id`` should be used to
+                pre-populate the review request data. If ``True``, the given
+                ``repository`` will be used to do so.
+
+            create_with_history (bool, optional):
+                Whether or not the created review request will support
+                attaching multiple commits per diff revision.
+
+                If ``False``, it will not be possible to use the
+                :py:class:`~reviewboard.webapi.resources.diff.DiffResource` to
+                upload diffs; the
+                :py:class:`~reviewboard.webapi.resources.DiffCommitResource`
+                must be used instead.
+
+        Returns:
+            reviewboard.reviews.models.review_request.ReviewRequest:
+            The created review request.
+
+        Raises:
+            reviewboard.hostingsvcs.errors.HostingServiceError:
+                The hosting service backing the repository encountered an
+                error.
+
+            reviewboard.scmtools.errors.ChangeNumberInUseError:
+                The commit ID is already in use by another review request.
+
+            reviewboard.scmtools.errors.SCMError:
+                The repository tool encountered an error.
+
+            ValueError:
+                An invalid value was passed for an argument.
         """
         from reviewboard.reviews.models import ReviewRequestDraft
 
@@ -142,6 +250,18 @@ class ReviewRequestManager(ConcurrencyManager):
             except (ObjectDoesNotExist, TypeError, ValueError):
                 pass
 
+        if create_with_history:
+            if repository is None:
+                raise ValueError('create_with_history requires a repository.')
+            elif create_from_commit_id:
+                raise ValueError(
+                    'create_from_commit_id and create_with_history cannot '
+                    'both be set to True.')
+            elif not repository.scmtool_class.supports_history:
+                raise ValueError(
+                    'This repository does not support review requests created '
+                    'with history.')
+
         # Create the review request. We're not going to actually save this
         # until we're confident we have all the data we need.
         review_request = self.model(
@@ -151,6 +271,8 @@ class ReviewRequestManager(ConcurrencyManager):
             repository=repository,
             diffset_history=DiffSetHistory(),
             local_site=local_site)
+
+        review_request.created_with_history = create_with_history
 
         if commit_id:
             review_request.commit = commit_id
@@ -297,6 +419,26 @@ class ReviewRequestManager(ConcurrencyManager):
         else:
             return Q(submitter__username=user_or_username)
 
+    def get_to_or_from_user_query(self, user_or_username):
+        """Return the query for review requests a user is involved in.
+
+        This is meant to be passed as an extra_query to
+        :py:meth:`ReviewRequest.objects.public <reviewboard.reviews
+        .managers.ReviewRequestManager.public>`.
+
+        Args:
+            user_or_username (django.contrib.auth.models.User or unicode):
+                The user object or username to query for.
+
+        Returns:
+            django.db.models.Q:
+            A query for all review requests the users is involved in as
+            either a submitter or a reviewer (either directly assigned or
+            indirectly as a member of a group).
+        """
+        return (self.get_to_user_query(user_or_username) |
+                self.get_from_user_query(user_or_username))
+
     def public(self, filter_private=True, *args, **kwargs):
         return self._query(filter_private=filter_private, *args, **kwargs)
 
@@ -304,6 +446,29 @@ class ReviewRequestManager(ConcurrencyManager):
         return self._query(
             extra_query=self.get_to_group_query(group_name, local_site),
             local_site=local_site,
+            *args, **kwargs)
+
+    def to_or_from_user(self, user_or_username, *args, **kwargs):
+        """Return the Queryset for review requests a user is involved in.
+
+        Args:
+            user_or_username (django.contrib.auth.models.User or unicode):
+                The user object or username to query for.
+
+            *args (tuple):
+                Extra postional arguments passed into handler.
+
+            **kwargs (dict):
+                Extra keyword arguments passed into handler.
+
+        Returns:
+            django.db.models.query.QuerySet:
+            A queryset of all review requests the users is involved in as
+            either a submitter or a reviewer (either directly assigned or
+            indirectly as a member of a group).
+        """
+        return self._query(
+            extra_query=self.get_to_or_from_user_query(user_or_username),
             *args, **kwargs)
 
     def to_user_groups(self, username, *args, **kwargs):

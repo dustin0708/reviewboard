@@ -9,8 +9,10 @@
 
 {% block scripts-post %}
 {{block.super}}
-{%  javascript 'widgets' %}
+{%  javascript 'djblets-config-forms' %}
+{%  javascript 'djblets-widgets' %}
 {%  javascript 'oauth-edit' %}
+{%  javascript 'widgets' %}
 {%  block admin_scripts_post %}{% endblock %}
 {% endblock %}
 
@@ -21,7 +23,8 @@
 
 {% block css %}
 {%  stylesheet 'admin' %}
-{%  stylesheet 'widgets' %}
+{%  stylesheet 'djblets-config-forms' %}
+{%  stylesheet 'djblets-widgets' %}
 {%  block extrastyle %}{% endblock %}
 <!--[if lte IE 7]><link rel="stylesheet" type="text/css" href="{% block stylesheet_ie %}{% static "admin/css/ie.css" %}{% endblock %}" /><![endif]-->
 {%  if LANGUAGE_BIDI %}<link rel="stylesheet" type="text/css" href="{% block stylesheet_rtl %}{% static "admin/css/rtl.css" %}{% endblock %}" />{% endif %}
@@ -60,11 +63,36 @@
 
 {% block navbar %}
 {%  if user.is_authenticated %}
-<ul id="navbar">
- <li><a href="{% url 'reviewboard.admin.views.dashboard' %}" class="nav-first">{% trans "Admin Dashboard" %}</a></li>
- <li><a href="{% url 'reviewboard.admin.views.dashboard' %}db/">{% trans "Database" %}</a></li>
- <li><a href="{% url 'djblets.extensions.views.extension_list' %}">{% trans "Extensions" %}</a></li>
- <li><a href="{% url 'integration-list' %}">{% trans "Integrations" %}</a></li>
+<ul class="rb-c-tabs" id="navbar">
+ {% url 'admin-dashboard' as dashboard_url %}
+ {% url 'admin:index' as database_url %}
+ {% url 'extension-list' as extensions_url %}
+ {% url 'integration-list' as integrations_url %}
+
+ <li class="rb-c-tabs__tab
+            {% if dashboard_url == request.path %}-is-active{% endif %}">
+  <label class="rb-c-tabs__tab-label">
+   <a href="{{dashboard_url}}" class="nav-first">{% trans "Admin Dashboard" %}</a>
+  </label>
+ </li>
+ <li class="rb-c-tabs__tab
+            {% if database_url == request.path %}-is-active{% endif %}">
+  <label class="rb-c-tabs__tab-label">
+   <a href="{{database_url}}">{% trans "Database" %}</a>
+  </label>
+ </li>
+ <li class="rb-c-tabs__tab
+            {% if extensions_url == request.path %}-is-active{% endif %}">
+  <label class="rb-c-tabs__tab-label">
+   <a href="{{extensions_url}}">{% trans "Extensions" %}</a>
+  </label>
+ </li>
+ <li class="rb-c-tabs__tab
+            {% if integrations_url == request.path %}-is-active{% endif %}">
+  <label class="rb-c-tabs__tab-label">
+   <a href="{{integrations_url}}">{% trans "Integrations" %}</a>
+  </label>
+ </li>
 </ul>
 {%   block subnavbar %}{% endblock %}
 {%  endif %}
@@ -73,7 +101,7 @@
 {% block navbar_post %}
 {%  if user.is_authenticated and not is_popup %}
 <div id="admin-actions" class="clear">
- {% admin_actions %}
+ {% admin_sidebar %}
 </div>
 {%  endif %}
 {% endblock %}
